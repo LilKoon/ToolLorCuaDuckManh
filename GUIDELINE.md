@@ -1,8 +1,8 @@
-# CVAT Cuboid Toolbox v2.5 — Hướng dẫn đầy đủ
+# CVAT Cuboid Toolbox v2.6 — Hướng dẫn đầy đủ
 
 Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: sửa kích thước, fit mặt đất theo point cloud, quản lý keyframe/track, kiểm tra ngưỡng LWH theo class, QA và snapshot.
 
-> File script: `cvat-cuboid-quicktool.user.js` (v2.5.0)  
+> File script: `cvat-cuboid-quicktool.user.js` (v2.6.0)  
 > Chỉ chạy trên trang `/jobs/` của CVAT 3D. Không cần reload trang sau khi cài.
 
 ---
@@ -66,7 +66,7 @@ Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: sửa kích thước, fit m
 
 1. Mở dashboard userscript → **Create new script**.
 2. Dán toàn bộ `cvat-cuboid-quicktool.user.js`.
-3. Lưu → mở trang job → kiểm tra console có `[CVAT-Toolbox] Khởi động v2.5.0`.
+3. Lưu → mở trang job → kiểm tra console có `[CVAT-Toolbox] Khởi động v2.6.0`.
 
 **Cập nhật**
 
@@ -451,6 +451,22 @@ Ngoài ngưỡng: 3/14 object, 47 frame.
 - Bỏ checkbox keyframe → clamp mọi frame (có confirm, tạo keyframe ở tất cả frame).
 - Sau khi **Check toàn bộ class**, bấm **📋 Copy kết quả check** để copy danh sách object/frame ngoài ngưỡng vào clipboard.
 
+**Danh sách object ngoài limits (chọn để sửa)**
+
+Ngay dưới kết quả check là danh sách các object đang ngoài ngưỡng:
+
+```
+☑ #4  — 12/120 frame — L max 6.20 (>5.5), W max 2.50 (>2.2)
+☑ #17 — 45/45 frame — H min 1.45 (<1.5)
+```
+
+- Mặc định **tick tất cả**; có thể bỏ tick object không muốn sửa.
+- **Chọn tất cả** bật/tắt toàn bộ (trạng thái indeterminate khi chọn một phần).
+- **🔧 Sửa object đã chọn (toàn bộ)**: chỉ sửa các object được tick, quét **toàn job** để chạm mọi keyframe của object đó (không chỉ dải đã check).
+  - Mặc định chỉ keyframe; bỏ checkbox **Clamp class chỉ keyframe** sẽ sửa mọi frame (có confirm).
+  - Giữ mặt đáy; object không tick không bị chạm.
+  - Sau khi sửa, object đã sửa được bỏ khỏi danh sách; bấm **Check lại** để quét mới.
+
 ### 8.5. Limits và QA
 
 - QA tính `size_dev` theo preset nếu có, nếu không thì theo midpoint limits.
@@ -553,14 +569,14 @@ Ngoài ngưỡng: 3/14 object, 47 frame.
 | Restore chỉ khôi phục một phần | Object đã bị xoá/đổi cấu trúc, hoặc snapshot vượt 2000 mục. |
 | CSV rỗng | Chưa **Quét QA** hoặc dải không có cuboid. |
 | Panel che UI | Kéo header sang vị trí khác; thu gọn bằng ✕. |
-| Script cũ vẫn chạy | Gỡ/tắt bản 1.x trong dashboard, chỉ để lại v2.5. |
+| Script cũ vẫn chạy | Gỡ/tắt bản 1.x trong dashboard, chỉ để lại v2.6. |
 | localStorage đầy | Xoá bớt snapshot (`Xoá tất cả snapshot`) hoặc dữ liệu `cqt_*`. |
 
 ---
 
 ## 12. Giới hạn & roadmap
 
-Đã có trong v2.5: 38 tính năng (LWH/preset/scale/copy, limits/clamp theo class, ground fit, cloud Z, occupancy, fit box beta, shift/rotate/smooth/decimate/resample, QA/CSV, snapshot/restore, log, kéo panel, giữ frame, đồng bộ/tách riêng, check class).
+Đã có trong v2.6: 39 tính năng (LWH/preset/scale/copy, limits/clamp theo class, ground fit, cloud Z, occupancy, fit box beta, shift/rotate/smooth/decimate/resample, QA/CSV, snapshot/restore, log, kéo panel, giữ frame, đồng bộ/tách riêng, check class).
 
 Chưa có (cân nhắc bản sau):
 
@@ -629,6 +645,7 @@ Trong CVAT, `savePoints` tại frame không phải keyframe sẽ tạo keyframe 
 
 ## 14. Lịch sử phiên bản
 
+- **2.6.0** — Thêm danh sách object ngoài limits sau khi Check class, tick chọn từng object và **🔧 Sửa object đã chọn (toàn bộ)**.
 - **2.5.0** — Thêm **📏 Kẹp** + **Tự kẹp limits** ngay trong tab Object (đồng bộ, lưu localStorage), **📋 Copy log** (QA) và **📋 Copy kết quả check** (Limits).
 - **2.4.0** — Check/Clamp toàn bộ class; quét toàn job hoặc dải; clamp class mặc định keyframe.
 - **2.3.0** — **🔗 Đồng bộ toàn track** và **✂️ Chỉ frame này**.
@@ -682,3 +699,4 @@ Trong CVAT, `savePoints` tại frame không phải keyframe sẽ tạo keyframe 
 | ⚡ Clamp toàn track | Limits | Kẹp cả track (tự dò dải) |
 | 🔎 Check class | Limits | Báo object/frame ngoài ngưỡng |
 | 📏 Clamp class | Limits | Kẹp mọi object của class |
+| 🔧 Sửa object đã chọn | Limits | Kẹp các object được tick trong danh sách check |

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CVAT Cuboid Toolbox (3D)
 // @namespace    https://github.com/vantixapps/cvat-tools
-// @version      2.5.0
+// @version      2.6.0
 // @description  Toolbox 3D cuboid cho CVAT: LWH/preset, fit mặt đất theo point cloud, track tools, QA, snapshot.
 // @author       Antigravity
 // @match        https://cvat-test.vantixapps.net/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  console.log('[CVAT-Toolbox] Khởi động v2.5.0');
+  console.log('[CVAT-Toolbox] Khởi động v2.6.0');
 
   // =========================================================================
   // CSS
@@ -219,6 +219,28 @@
     .cqt-status.success { color: #52c41a; background: #162312; border: 1px solid #274916; }
     .cqt-status.error { color: #ff4d4f; background: #2a1215; border: 1px solid #58181c; }
     .cqt-status.warn { color: #faad14; background: #2b2111; border: 1px solid #594214; }
+    .cqt-candidates {
+      background: #141414;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 6px;
+      max-height: 170px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 10px;
+      line-height: 1.35;
+      color: #bbb;
+    }
+    .cqt-candidate {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .cqt-candidate input { margin: 2px 0 0 0; flex: none; }
+    .cqt-candidate span { word-break: break-word; }
     .cqt-log {
       background: #141414;
       border: 1px solid #333;
@@ -1207,6 +1229,14 @@
             <button id="cqt-btn-limit-clamp-class" class="cqt-btn cqt-btn-ground">📏 Clamp toàn bộ class</button>
             <pre id="cqt-limit-result" class="cqt-log">Chưa kiểm tra class.</pre>
             <button id="cqt-btn-copy-limit-result" class="cqt-btn cqt-btn-secondary">📋 Copy kết quả check</button>
+
+            <div class="cqt-divider"></div>
+            <div class="cqt-label" style="font-weight:600;color:#fff;">Object ngoài limits (chọn để sửa)</div>
+            <label class="cqt-check">
+              <input type="checkbox" id="cqt-cand-all" checked /> Chọn tất cả
+            </label>
+            <div id="cqt-limit-candidates" class="cqt-candidates">Chưa check class.</div>
+            <button id="cqt-btn-limit-fix-selected" class="cqt-btn cqt-btn-ground">🔧 Sửa object đã chọn (toàn bộ)</button>
           </div>
         </div>
 
@@ -1233,6 +1263,7 @@
     refreshPresetList();
     refreshSnapshotList();
     refreshLimitClassList();
+    renderCandidates();
     syncFrameLabel();
   }
 
@@ -1441,6 +1472,13 @@
     wrapper.querySelector('#cqt-btn-limit-clamp-track').addEventListener('click', () => clampWholeTrack());
     wrapper.querySelector('#cqt-btn-limit-check-class').addEventListener('click', () => checkClassLimits());
     wrapper.querySelector('#cqt-btn-limit-clamp-class').addEventListener('click', () => clampClassLimits());
+    wrapper.querySelector('#cqt-cand-all').addEventListener('change', (e) => {
+      wrapper.querySelectorAll('#cqt-limit-candidates input[data-id]').forEach((cb) => {
+        cb.checked = e.target.checked;
+      });
+      updateCandidateSelectAll();
+    });
+    wrapper.querySelector('#cqt-btn-limit-fix-selected').addEventListener('click', () => clampSelectedCandidates());
   }
 
   function bindPanelDrag(wrapper) {
@@ -1634,6 +1672,7 @@
       ta.style.left = '-9999px';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
+      ta.focus();
       ta.select();
       ta.setSelectionRange(0, ta.value.length);
       const ok = document.execCommand('copy');
@@ -1657,10 +1696,20 @@
   }
 
   async function copyLimitResult() {
-    const text = document.querySelector('#cqt-limit-result')?.textContent?.trim() || '';
+    let text = document.querySelector('#cqt-limit-result')?.textContent?.trim() || '';
     if (!text || text === 'Chưa kiểm tra class.') {
       return setStatus('⚠️ Chưa có kết quả check để copy.', 'error');
     }
+
+    // Copy đầy đủ danh sách (không chỉ 20 dòng đầu)
+    if (lastClassCandidates.length) {
+      const head = text.split('\n').slice(0, 2);
+      const rows = lastClassCandidates.map(
+        (c) => `#${c.id}: ${c.badFrames}/${c.frames} frame ngoài — ${c.summary}`
+      );
+      text = [...head, ...rows].join('\n');
+    }
+
     const ok = await copyToClipboard(text);
     setStatus(
       ok ? '📋 Đã copy kết quả check class.' : '❌ Không copy được (clipboard bị chặn).',
@@ -2307,6 +2356,167 @@
     return { from, to, jobInstance, allJob };
   }
 
+  function formatLimitIssues(rec, lim) {
+    const parts = [];
+    if (rec.maxL > lim.l[1] + 1e-9) parts.push(`L max ${rec.maxL.toFixed(2)} (>${lim.l[1]})`);
+    if (rec.minL < lim.l[0] - 1e-9) parts.push(`L min ${rec.minL.toFixed(2)} (<${lim.l[0]})`);
+    if (rec.maxW > lim.w[1] + 1e-9) parts.push(`W max ${rec.maxW.toFixed(2)} (>${lim.w[1]})`);
+    if (rec.minW < lim.w[0] - 1e-9) parts.push(`W min ${rec.minW.toFixed(2)} (<${lim.w[0]})`);
+    if (rec.maxH > lim.h[1] + 1e-9) parts.push(`H max ${rec.maxH.toFixed(2)} (>${lim.h[1]})`);
+    if (rec.minH < lim.h[0] - 1e-9) parts.push(`H min ${rec.minH.toFixed(2)} (<${lim.h[0]})`);
+    return parts;
+  }
+
+  function updateCandidateSelectAll() {
+    const master = document.querySelector('#cqt-cand-all');
+    const box = document.querySelector('#cqt-limit-candidates');
+    if (!master || !box) return;
+    const boxes = [...box.querySelectorAll('input[data-id]')];
+    const checked = boxes.filter((cb) => cb.checked).length;
+    master.disabled = boxes.length === 0;
+    master.checked = boxes.length > 0 && checked === boxes.length;
+    master.indeterminate = checked > 0 && checked < boxes.length;
+  }
+
+  function renderCandidates() {
+    const box = document.querySelector('#cqt-limit-candidates');
+    if (!box) return;
+    box.innerHTML = '';
+
+    if (!lastClassCandidates.length) {
+      const empty = document.createElement('div');
+      empty.textContent = 'Không có object ngoài limits (hoặc chưa Check class).';
+      empty.style.color = '#8c8c8c';
+      box.appendChild(empty);
+      updateCandidateSelectAll();
+      return;
+    }
+
+    lastClassCandidates.slice(0, 100).forEach((c) => {
+      const label = document.createElement('label');
+      label.className = 'cqt-candidate';
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.dataset.id = String(c.id);
+      cb.addEventListener('change', updateCandidateSelectAll);
+
+      const span = document.createElement('span');
+      span.textContent = `#${c.id} — ${c.badFrames}/${c.frames} frame — ${c.summary}`;
+
+      label.appendChild(cb);
+      label.appendChild(span);
+      box.appendChild(label);
+    });
+
+    if (lastClassCandidates.length > 100) {
+      const more = document.createElement('div');
+      more.textContent = `... +${lastClassCandidates.length - 100} object khác`;
+      more.style.color = '#8c8c8c';
+      box.appendChild(more);
+    }
+
+    updateCandidateSelectAll();
+  }
+
+  async function clampSelectedCandidates() {
+    const className = String(val('cqt-limit-class') || '').trim();
+    const lim = className ? getLimits()[className] : null;
+    if (!lim) return setStatus('⚠️ Chọn class có limits trước.', 'error');
+
+    if (!lastClassCandidates.length) {
+      return setStatus('⚠️ Chưa có danh sách object ngoài limits. Bấm "Check toàn bộ class" trước.', 'error');
+    }
+    if (!lastClassCheckName || normalizeClass(lastClassCheckName) !== normalizeClass(className)) {
+      return setStatus('⚠️ Danh sách thuộc class khác. Bấm Check lại cho class đang chọn.', 'error');
+    }
+
+    const selected = [...document.querySelectorAll('#cqt-limit-candidates input[data-id]:checked')]
+      .map((cb) => parseInt(cb.dataset.id, 10))
+      .filter((id) => Number.isInteger(id));
+
+    if (!selected.length) return setStatus('⚠️ Tick ít nhất 1 object cần sửa.', 'error');
+
+    const { jobInstance } = getCvatContext();
+    if (!isUsableJob(jobInstance)) return setStatus('⚠️ Chưa kết nối CVAT Job!', 'error');
+
+    const jobStart = Number.isInteger(jobInstance.startFrame) ? jobInstance.startFrame : intVal('cqt-frame-start');
+    const jobStop = Number.isInteger(jobInstance.stopFrame) ? jobInstance.stopFrame : intVal('cqt-frame-end');
+    if (!Number.isInteger(jobStart) || !Number.isInteger(jobStop) || jobStart > jobStop) {
+      return setStatus('⚠️ Không đọc được dải frame của job.', 'error');
+    }
+
+    const keyframesOnly = document.querySelector('#cqt-limit-class-keyframes').checked;
+    if (!keyframesOnly &&
+      !confirm('Sửa mọi frame của các object đã chọn sẽ tạo keyframe ở tất cả frame. Tiếp tục?')) {
+      return;
+    }
+    if (jobStop - jobStart > 5000 &&
+      !confirm(`Sẽ quét ${jobStop - jobStart + 1} frame cho ${selected.length} object. Tiếp tục?`)) {
+      return;
+    }
+
+    const selectedSet = new Set(selected.map(String));
+    const changedIds = new Set();
+    const snap = [];
+    let changedFrames = 0;
+
+    setStatus(`⏳ Sửa ${selected.length} object đã chọn...`);
+
+    for (let f = jobStart; f <= jobStop; f++) {
+      if (f > jobStart && (f - jobStart) % 100 === 0) {
+        setStatus(`⏳ Sửa object: frame ${f}/${jobStop}...`);
+        await sleep(0);
+      }
+
+      const states = await jobInstance.annotations.get(f, true);
+      for (const s of states) {
+        if (!s?.points || s.points.length < 9 || s.outside) continue;
+        if (!selectedSet.has(String(s.clientID))) continue;
+        if (!matchClassLabel(s.label, className)) continue;
+        if (keyframesOnly && !s.keyframe) continue;
+
+        const p = [...s.points];
+        const before = { l: p[6], w: p[7], h: p[8] };
+        const after = clampLWHValues(before.l, before.w, before.h, lim);
+        if (
+          Math.abs(after.l - before.l) < 1e-9 &&
+          Math.abs(after.w - before.w) < 1e-9 &&
+          Math.abs(after.h - before.h) < 1e-9
+        ) continue;
+
+        snap.push(snapshotItem(s, f));
+        const oldBottom = bottomZ(p);
+        p[6] = after.l;
+        p[7] = after.w;
+        p[8] = after.h;
+        p[2] = oldBottom + lowestOffset(p);
+        s.points = p;
+        saveState(s, jobInstance);
+        changedFrames++;
+        changedIds.add(String(s.clientID));
+      }
+    }
+
+    if (!changedFrames) {
+      return setStatus('ℹ️ Các object đã chọn không có frame nào cần sửa (có thể đã trong ngưỡng).', 'success');
+    }
+
+    pushSnapshot('Clamp selected objects', snap);
+    lastClassCandidates = lastClassCandidates.filter((c) => !changedIds.has(String(c.id)));
+    renderCandidates();
+
+    const restored = await refreshCanvas();
+    setStatus(
+      `🔧 Đã sửa ${changedIds.size}/${selected.length} object (${changedFrames} frame). ` +
+      `Còn ${lastClassCandidates.length} object trong danh sách.` +
+      ' Ctrl+S để lưu.' +
+      (restored ? '' : ' ⚠️ Chưa tự về frame cũ.'),
+      'success'
+    );
+  }
+
   async function checkClassLimits() {
     const className = String(val('cqt-limit-class') || '').trim();
     const lim = className ? getLimits()[className] : null;
@@ -2380,15 +2590,19 @@
     lines.push(`Ngoài ngưỡng: ${badObjects.length}/${byId.size} object, ${badFrames} frame.`);
 
     badObjects.sort((a, b) => b.badFrames - a.badFrames);
-    for (const r of badObjects.slice(0, 20)) {
-      const parts = [];
-      if (r.maxL > lim.l[1] + 1e-9) parts.push(`L max ${r.maxL.toFixed(2)} (>${lim.l[1]})`);
-      if (r.minL < lim.l[0] - 1e-9) parts.push(`L min ${r.minL.toFixed(2)} (<${lim.l[0]})`);
-      if (r.maxW > lim.w[1] + 1e-9) parts.push(`W max ${r.maxW.toFixed(2)} (>${lim.w[1]})`);
-      if (r.minW < lim.w[0] - 1e-9) parts.push(`W min ${r.minW.toFixed(2)} (<${lim.w[0]})`);
-      if (r.maxH > lim.h[1] + 1e-9) parts.push(`H max ${r.maxH.toFixed(2)} (>${lim.h[1]})`);
-      if (r.minH < lim.h[0] - 1e-9) parts.push(`H min ${r.minH.toFixed(2)} (<${lim.h[0]})`);
 
+    lastClassCandidates = badObjects.map((r) => ({
+      id: r.id,
+      label: className,
+      frames: r.frames,
+      badFrames: r.badFrames,
+      summary: formatLimitIssues(r, lim).join(', '),
+    }));
+    lastClassCheckName = className;
+    renderCandidates();
+
+    for (const r of badObjects.slice(0, 20)) {
+      const parts = formatLimitIssues(r, lim);
       lines.push(
         `#${r.id}: ${r.badFrames}/${r.frames} frame ngoài` +
         (parts.length ? ` — ${parts.join(', ')}` : '')
@@ -2470,10 +2684,14 @@
     }
 
     pushSnapshot(`Clamp class "${className}"`, snap);
+    lastClassCandidates = [];
+    lastClassCheckName = className;
+    renderCandidates();
     const restored = await refreshCanvas();
 
     setStatus(
       `📏 Clamp class "${className}": ${objects.size} object, ${changed} frame. ` +
+      'Bấm Check lại để cập nhật danh sách. ' +
       'Ctrl+S để lưu.' +
       (restored ? '' : ' ⚠️ Chưa tự về frame cũ.'),
       'success'
@@ -2540,6 +2758,9 @@
         'success'
       );
     }
+
+    lastClassCandidates = lastClassCandidates.filter((c) => String(c.id) !== String(range.targetId));
+    renderCandidates();
 
     const restored = await refreshCanvas();
     const parts = [];
@@ -3282,6 +3503,8 @@
   // =========================================================================
   let lastQARows = [];
   let lastQAMeta = null;
+  let lastClassCandidates = [];
+  let lastClassCheckName = null;
 
   function readFrameRange() {
     const startFrame = intVal('cqt-frame-start');
