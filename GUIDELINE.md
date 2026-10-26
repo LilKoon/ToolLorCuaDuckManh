@@ -1,8 +1,8 @@
-# CVAT Cuboid Toolbox v2.4 — Hướng dẫn đầy đủ
+# CVAT Cuboid Toolbox v2.5 — Hướng dẫn đầy đủ
 
 Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: sửa kích thước, fit mặt đất theo point cloud, quản lý keyframe/track, kiểm tra ngưỡng LWH theo class, QA và snapshot.
 
-> File script: `cvat-cuboid-quicktool.user.js` (v2.4.0)  
+> File script: `cvat-cuboid-quicktool.user.js` (v2.5.0)  
 > Chỉ chạy trên trang `/jobs/` của CVAT 3D. Không cần reload trang sau khi cài.
 
 ---
@@ -66,7 +66,7 @@ Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: sửa kích thước, fit m
 
 1. Mở dashboard userscript → **Create new script**.
 2. Dán toàn bộ `cvat-cuboid-quicktool.user.js`.
-3. Lưu → mở trang job → kiểm tra console có `[CVAT-Toolbox] Khởi động v2.4.0`.
+3. Lưu → mở trang job → kiểm tra console có `[CVAT-Toolbox] Khởi động v2.5.0`.
 
 **Cập nhật**
 
@@ -213,6 +213,8 @@ Ví dụ: Start 40, count 120 → End 159.
 ### 4.3. Kích thước LWH
 
 - **Lấy size**: đọc LWH từ object tại frame hiện tại, đồng thời cảnh báo nếu ngoài limits.
+- **📏 Kẹp**: kẹp LWH **đang nhập** theo limits của class, cập nhật lại 3 ô (chưa sửa object). Dùng để xem trước giá trị hợp lệ trước khi Áp dụng.
+- **Tự kẹp limits** (mặc định bật): đồng bộ với checkbox ở tab Limits, lưu vào `localStorage`. Khi bật, rời ô L/W/H sẽ tự kẹp giá trị; khi Áp dụng / Đồng bộ / Chỉ frame này cũng tự kẹp.
 - **Giữ đáy** (mặc định bật): khi đổi H, giữ nguyên cao độ mặt đáy; đúng cả khi box nghiêng.
 - **Chỉ keyframe**: chỉ sửa frame đang là keyframe (dùng cho Áp dụng LWH theo dải).
 
@@ -224,7 +226,7 @@ Ví dụ: Start 40, count 120 → End 159.
 | **🔗 Đồng bộ toàn track** | Mọi keyframe của object | Frame nội suy tự theo; không tạo keyframe mới |
 | **✂️ Chỉ frame này** | Đúng frame hiện tại | Các frame khác giữ nguyên; tạo keyframe nếu cần |
 
-Cả 3 đều tự kẹp limits nếu checkbox **Tự clamp khi Áp dụng LWH** (tab Limits) đang bật.
+Cả 3 đều tự kẹp limits nếu **Tự kẹp limits** (tab Object) hoặc **Tự clamp khi Áp dụng LWH** (tab Limits) đang bật — hai checkbox này là một thiết lập, tự đồng bộ và được nhớ cho lần sau.
 
 **Ví dụ**
 
@@ -396,6 +398,8 @@ Cột: `clientID,label,frames,keyframes,gap_min,gap_max,size_dev,issues`.
 
 Hiển thị 60 dòng thao tác gần nhất kèm giờ. Chỉ ghi các thao tác có trạng thái success/error/warn.
 
+Nút **📋 Copy log** sao chép toàn bộ log vào clipboard để dán vào báo cáo/claim.
+
 ---
 
 ## 8. Tab Limits
@@ -420,7 +424,7 @@ Lần đầu chạy, 3 class này tự được tạo trong `localStorage` (`cqt
 
 ### 8.3. Clamp
 
-- **Tự clamp khi Áp dụng LWH** (mặc định bật): mọi lần Áp dụng / Đồng bộ / Chỉ frame này đều kẹp theo limits.
+- **Tự clamp khi Áp dụng LWH** (mặc định bật): mọi lần Áp dụng / Đồng bộ / Chỉ frame này đều kẹp theo limits. Checkbox này đồng bộ với **Tự kẹp limits** ở tab Object và được lưu lại.
 - **📏 Clamp object theo limits**: quét dải Start–End, tùy chọn **Clamp chỉ keyframe** (mặc định tắt), giữ mặt đáy.
 - **⚡ Clamp toàn track (tự lấy dải)**: tự dò frame đầu/cuối của object rồi clamp, không cần nhập Start/End. Dùng chung checkbox **Clamp chỉ keyframe** ở trên (mặc định tắt = clamp mọi frame).
 
@@ -445,6 +449,7 @@ Ngoài ngưỡng: 3/14 object, 47 frame.
 - Kẹp mọi object của class; chỉ chiều vượt ngưỡng bị đổi.
 - Giữ mặt đáy từng object; object đã đúng không bị chạm.
 - Bỏ checkbox keyframe → clamp mọi frame (có confirm, tạo keyframe ở tất cả frame).
+- Sau khi **Check toàn bộ class**, bấm **📋 Copy kết quả check** để copy danh sách object/frame ngoài ngưỡng vào clipboard.
 
 ### 8.5. Limits và QA
 
@@ -548,14 +553,14 @@ Ngoài ngưỡng: 3/14 object, 47 frame.
 | Restore chỉ khôi phục một phần | Object đã bị xoá/đổi cấu trúc, hoặc snapshot vượt 2000 mục. |
 | CSV rỗng | Chưa **Quét QA** hoặc dải không có cuboid. |
 | Panel che UI | Kéo header sang vị trí khác; thu gọn bằng ✕. |
-| Script cũ vẫn chạy | Gỡ/tắt bản 1.x trong dashboard, chỉ để lại v2.4. |
+| Script cũ vẫn chạy | Gỡ/tắt bản 1.x trong dashboard, chỉ để lại v2.5. |
 | localStorage đầy | Xoá bớt snapshot (`Xoá tất cả snapshot`) hoặc dữ liệu `cqt_*`. |
 
 ---
 
 ## 12. Giới hạn & roadmap
 
-Đã có trong v2.4: 35 tính năng (LWH/preset/scale/copy, limits/clamp theo class, ground fit, cloud Z, occupancy, fit box beta, shift/rotate/smooth/decimate/resample, QA/CSV, snapshot/restore, log, kéo panel, giữ frame, đồng bộ/tách riêng, check class).
+Đã có trong v2.5: 38 tính năng (LWH/preset/scale/copy, limits/clamp theo class, ground fit, cloud Z, occupancy, fit box beta, shift/rotate/smooth/decimate/resample, QA/CSV, snapshot/restore, log, kéo panel, giữ frame, đồng bộ/tách riêng, check class).
 
 Chưa có (cân nhắc bản sau):
 
@@ -624,6 +629,7 @@ Trong CVAT, `savePoints` tại frame không phải keyframe sẽ tạo keyframe 
 
 ## 14. Lịch sử phiên bản
 
+- **2.5.0** — Thêm **📏 Kẹp** + **Tự kẹp limits** ngay trong tab Object (đồng bộ, lưu localStorage), **📋 Copy log** (QA) và **📋 Copy kết quả check** (Limits).
 - **2.4.0** — Check/Clamp toàn bộ class; quét toàn job hoặc dải; clamp class mặc định keyframe.
 - **2.3.0** — **🔗 Đồng bộ toàn track** và **✂️ Chỉ frame này**.
 - **2.2.0** — Tổng số frame của object; tự dò dải; Clamp toàn track.
@@ -643,6 +649,10 @@ Trong CVAT, `savePoints` tại frame không phải keyframe sẽ tạo keyframe 
 |---|---|---|
 | 🎯 Auto | Object | Lấy object đang chọn + LWH + preset/limits |
 | Lấy size | Object | Đọc LWH hiện tại, cảnh báo ngoài limits |
+| 📏 Kẹp | Object | Kẹp LWH đang nhập theo limits của class |
+| Tự kẹp limits | Object | Bật/tắt tự kẹp khi nhập hoặc áp dụng |
+| 📋 Copy log | QA | Copy log thao tác |
+| 📋 Copy kết quả check | Limits | Copy báo cáo check class |
 | 📐 Áp dụng LWH | Object | Áp LWH cho dải Start–End |
 | 🔗 Đồng bộ toàn track | Object | Áp LWH cho mọi keyframe, cả track theo |
 | ✂️ Chỉ frame này | Object | Chỉ sửa frame hiện tại |

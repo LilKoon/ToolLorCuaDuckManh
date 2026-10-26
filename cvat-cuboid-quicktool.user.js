@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CVAT Cuboid Toolbox (3D)
 // @namespace    https://github.com/vantixapps/cvat-tools
-// @version      2.4.0
+// @version      2.5.0
 // @description  Toolbox 3D cuboid cho CVAT: LWH/preset, fit mặt đất theo point cloud, track tools, QA, snapshot.
 // @author       Antigravity
 // @match        https://cvat-test.vantixapps.net/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  console.log('[CVAT-Toolbox] Khởi động v2.4.0');
+  console.log('[CVAT-Toolbox] Khởi động v2.5.0');
 
   // =========================================================================
   // CSS
@@ -248,6 +248,9 @@
   const LS_CLIPBOARD = 'cqt_clipboard_v2';
   const LS_TOP = 'cqt_panel_top_v2';
   const LS_LIMITS = 'cqt_limits_v2';
+  const LS_AUTOCLAMP = 'cqt_autoclamp_v2';
+
+  let autoClampEnabled = true;
 
   const DEFAULT_LIMITS = {
     vehicle: { l: [3.2, 5.5], w: [1.6, 2.2], h: [1.5, 1.9] },
@@ -649,7 +652,7 @@
   async function refreshCanvas() {
     try {
       window.dispatchEvent(new Event('resize'));
-    } catch (e) {}
+    } catch (e) { }
 
     const original = getPlayerFrame();
     if (!Number.isInteger(original)) return true;
@@ -778,7 +781,7 @@
     if (jobInstance?.annotations?.put) {
       try {
         jobInstance.annotations.put([state]);
-      } catch (e) {}
+      } catch (e) { }
     }
   }
 
@@ -947,9 +950,14 @@
 
             <div class="cqt-row" style="justify-content:space-between;align-items:baseline;">
               <span class="cqt-label" style="font-weight:600;color:#fff;">1. Kích thước LWH (m)</span>
-              <button id="cqt-btn-get-lwh" class="cqt-btn cqt-btn-secondary" style="flex:none;padding:2px 6px;font-size:10px;">
-                Lấy size
-              </button>
+              <div style="display:flex;gap:6px;">
+                <button id="cqt-btn-clamp-inputs" class="cqt-btn cqt-btn-secondary" style="flex:none;padding:2px 6px;font-size:10px;" title="Kẹp LWH đang nhập theo limits của class">
+                  📏 Kẹp
+                </button>
+                <button id="cqt-btn-get-lwh" class="cqt-btn cqt-btn-secondary" style="flex:none;padding:2px 6px;font-size:10px;">
+                  Lấy size
+                </button>
+              </div>
             </div>
             <div class="cqt-row">
               <div class="cqt-col">
@@ -971,6 +979,9 @@
               </label>
               <label class="cqt-check" title="Chỉ sửa frame đang là keyframe">
                 <input type="checkbox" id="cqt-lwh-keyframe-only" /> Chỉ keyframe
+              </label>
+              <label class="cqt-check" title="Tự kẹp LWH vào limits của class khi nhập hoặc áp dụng">
+                <input type="checkbox" id="cqt-obj-clamp-on-apply" checked /> Tự kẹp limits
               </label>
             </div>
             <button id="cqt-btn-apply-lwh" class="cqt-btn">📐 Áp dụng LWH</button>
@@ -1140,6 +1151,7 @@
 
             <div class="cqt-divider"></div>
             <pre id="cqt-log" class="cqt-log">Log thao tác...</pre>
+            <button id="cqt-btn-copy-log" class="cqt-btn cqt-btn-secondary">📋 Copy log</button>
           </div>
 
           <!-- ================= LIMITS ================= -->
@@ -1194,6 +1206,7 @@
             <button id="cqt-btn-limit-check-class" class="cqt-btn cqt-btn-secondary">🔎 Check toàn bộ class</button>
             <button id="cqt-btn-limit-clamp-class" class="cqt-btn cqt-btn-ground">📏 Clamp toàn bộ class</button>
             <pre id="cqt-limit-result" class="cqt-log">Chưa kiểm tra class.</pre>
+            <button id="cqt-btn-copy-limit-result" class="cqt-btn cqt-btn-secondary">📋 Copy kết quả check</button>
           </div>
         </div>
 
@@ -1203,6 +1216,8 @@
 
     document.body.appendChild(wrapper);
     bindEvents(wrapper);
+    autoClampEnabled = lsGet(LS_AUTOCLAMP, true) !== false;
+    setAutoClamp(autoClampEnabled, false);
     restorePanelTop(wrapper);
 
     const { jobInstance } = getCvatContext();
@@ -1347,6 +1362,19 @@
     wrapper.querySelector('#cqt-btn-apply-count').addEventListener('click', () => applyFrameCount());
     wrapper.querySelector('#cqt-btn-sync-track').addEventListener('click', () => syncLWHToTrack());
     wrapper.querySelector('#cqt-btn-apply-frame').addEventListener('click', () => applyLWHCurrentFrame());
+    wrapper.querySelector('#cqt-btn-clamp-inputs').addEventListener('click', () => clampInputsNow(false));
+
+    ['cqt-lwh-l', 'cqt-lwh-w', 'cqt-lwh-h'].forEach((id) => {
+      wrapper.querySelector(`#${id}`).addEventListener('change', () => {
+        if (autoClampEnabled) clampInputsNow(true);
+      });
+    });
+
+    wrapper.querySelector('#cqt-limit-clamp-on-apply').addEventListener('change', (e) => setAutoClamp(e.target.checked));
+    wrapper.querySelector('#cqt-obj-clamp-on-apply').addEventListener('change', (e) => setAutoClamp(e.target.checked));
+
+    wrapper.querySelector('#cqt-btn-copy-log').addEventListener('click', () => copyLog());
+    wrapper.querySelector('#cqt-btn-copy-limit-result').addEventListener('click', () => copyLimitResult());
     wrapper.querySelector('#cqt-frame-count').addEventListener('change', () => {
       if (Number.isInteger(intVal('cqt-frame-start')) && Number.isInteger(intVal('cqt-frame-count'))) {
         applyFrameCount();
@@ -1441,7 +1469,7 @@
       document.body.style.cursor = '';
       try {
         lsSet(LS_TOP, parseInt(wrapper.style.top, 10) || 100);
-      } catch (e) {}
+      } catch (e) { }
     });
   }
 
@@ -1482,7 +1510,7 @@
         let count = 0;
         try {
           count = (await jobInstance.annotations.get(targetFrame, true)).length;
-        } catch (e) {}
+        } catch (e) { }
 
         // Tìm quanh frame hiện tại (±30) để gợi ý frame có object
         let foundAt = null;
@@ -1497,7 +1525,7 @@
                 foundAt = f;
                 break;
               }
-            } catch (e) {}
+            } catch (e) { }
           }
         }
 
@@ -1542,8 +1570,106 @@
     }
   }
 
+  function setAutoClamp(value, persist = true) {
+    autoClampEnabled = !!value;
+    if (persist) lsSet(LS_AUTOCLAMP, autoClampEnabled);
+    ['cqt-limit-clamp-on-apply', 'cqt-obj-clamp-on-apply'].forEach((id) => {
+      const el = document.querySelector(`#${id}`);
+      if (el && el.checked !== autoClampEnabled) el.checked = autoClampEnabled;
+    });
+  }
+
+  async function clampInputsNow(silent = false) {
+    const id = resolveTargetId();
+    if (!Number.isInteger(id)) {
+      if (!silent) setStatus('⚠️ Chọn object trước!', 'error');
+      return;
+    }
+
+    const l = numVal('cqt-lwh-l');
+    const w = numVal('cqt-lwh-w');
+    const h = numVal('cqt-lwh-h');
+    if (!(l > 0 && w > 0 && h > 0)) {
+      if (!silent) setStatus('⚠️ Nhập đủ L, W, H dương!', 'error');
+      return;
+    }
+
+    const label = await getLabelForTarget(id, intVal('cqt-frame-start'));
+    const lim = label ? getLimitsForLabel(label) : null;
+    if (!lim) {
+      if (!silent) setStatus(`⚠️ Chưa có limits cho class "${label || '?'}".`, 'error');
+      return;
+    }
+
+    const c = clampLWHValues(l, w, h, lim);
+    const changes = [];
+    if (Math.abs(c.l - l) > 1e-9) changes.push(`L ${l.toFixed(2)}→${c.l.toFixed(2)}`);
+    if (Math.abs(c.w - w) > 1e-9) changes.push(`W ${w.toFixed(2)}→${c.w.toFixed(2)}`);
+    if (Math.abs(c.h - h) > 1e-9) changes.push(`H ${h.toFixed(2)}→${c.h.toFixed(2)}`);
+
+    if (!changes.length) {
+      if (!silent) setStatus(`ℹ️ LWH đã trong limits [${label}].`, 'success');
+      return;
+    }
+
+    setFieldValue('cqt-lwh-l', c.l.toFixed(3));
+    setFieldValue('cqt-lwh-w', c.w.toFixed(3));
+    setFieldValue('cqt-lwh-h', c.h.toFixed(3));
+    setStatus(`📏 Kẹp limits [${label}]: ${changes.join(', ')}.`, 'success');
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard?.writeText && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) { }
+
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function copyLog() {
+    const text = document.querySelector('#cqt-log')?.textContent?.trim() || '';
+    if (!text || text === 'Log thao tác...') {
+      return setStatus('⚠️ Log đang trống.', 'error');
+    }
+    const ok = await copyToClipboard(text);
+    setStatus(
+      ok ? '📋 Đã copy log vào clipboard.' : '❌ Không copy được (clipboard bị chặn).',
+      ok ? 'success' : 'error'
+    );
+  }
+
+  async function copyLimitResult() {
+    const text = document.querySelector('#cqt-limit-result')?.textContent?.trim() || '';
+    if (!text || text === 'Chưa kiểm tra class.') {
+      return setStatus('⚠️ Chưa có kết quả check để copy.', 'error');
+    }
+    const ok = await copyToClipboard(text);
+    setStatus(
+      ok ? '📋 Đã copy kết quả check class.' : '❌ Không copy được (clipboard bị chặn).',
+      ok ? 'success' : 'error'
+    );
+  }
+
   async function clampLWHInputs(targetId, frameHint, l, w, h) {
-    if (!document.querySelector('#cqt-limit-clamp-on-apply')?.checked) {
+    if (!autoClampEnabled) {
       return { l, w, h, note: '', changed: false, label: null };
     }
 
@@ -1829,7 +1955,7 @@
         select.value = key;
         loadLimitForm(key);
       }
-    } catch (e) {}
+    } catch (e) { }
   }
 
   async function savePresetForCurrent() {
@@ -2091,7 +2217,7 @@
     }
 
     if (jobStop - jobStart > 5000 &&
-        !confirm(`Job có ${jobStop - jobStart + 1} frame, dò toàn bộ có thể mất vài giây. Tiếp tục?`)) {
+      !confirm(`Job có ${jobStop - jobStart + 1} frame, dò toàn bộ có thể mất vài giây. Tiếp tục?`)) {
       return null;
     }
 
@@ -2174,7 +2300,7 @@
     }
 
     if (to - from > 5000 &&
-        !confirm(`Sẽ quét ${to - from + 1} frame, có thể mất vài giây. Tiếp tục?`)) {
+      !confirm(`Sẽ quét ${to - from + 1} frame, có thể mất vài giây. Tiếp tục?`)) {
       return null;
     }
 
@@ -2290,7 +2416,7 @@
 
     const keyframesOnly = document.querySelector('#cqt-limit-class-keyframes').checked;
     if (!keyframesOnly &&
-        !confirm('Clamp mọi frame của mọi object trong class sẽ tạo keyframe ở tất cả frame. Tiếp tục?')) {
+      !confirm('Clamp mọi frame của mọi object trong class sẽ tạo keyframe ở tất cả frame. Tiếp tục?')) {
       return;
     }
 
