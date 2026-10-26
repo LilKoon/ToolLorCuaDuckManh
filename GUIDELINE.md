@@ -1,8 +1,8 @@
-# CVAT Cuboid Toolbox v2.4 — Hướng dẫn đầy đủ
+# CVAT Cuboid Toolbox v2.5 — Hướng dẫn đầy đủ
 
 Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: sửa kích thước, fit mặt đất theo point cloud, quản lý keyframe/track, kiểm tra ngưỡng LWH theo class, QA và snapshot.
 
-> File script: `cvat-cuboid-quicktool.user.js` (v2.4.0)  
+> File script: `cvat-cuboid-quicktool.user.js` (v2.5.0)  
 > Chỉ chạy trên trang `/jobs/` của CVAT 3D. Không cần reload trang sau khi cài.
 
 ---
@@ -66,7 +66,7 @@ Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: sửa kích thước, fit m
 
 1. Mở dashboard userscript → **Create new script**.
 2. Dán toàn bộ `cvat-cuboid-quicktool.user.js`.
-3. Lưu → mở trang job → kiểm tra console có `[CVAT-Toolbox] Khởi động v2.4.0`.
+3. Lưu → mở trang job → kiểm tra console có `[CVAT-Toolbox] Khởi động v2.5.0`.
 
 **Cập nhật**
 
@@ -282,8 +282,17 @@ Sau khi bấm, Z được điền vào ô; kiểm tra lại rồi mới Fit.
 
 **Chế độ**
 
-- **Snap đáy (giữ nghiêng)**: tịnh tiến box để điểm thấp nhất trong 8 góc chạm Z. Box nghiêng chỉ chạm bằng 1 góc.
+- **Snap đáy (giữ nghiêng)**: tịnh tiến box để điểm thấp nhất trong 8 góc chạm Z cố định. Box nghiêng chỉ chạm bằng 1 góc.
 - **Đặt phẳng đáy**: bỏ pitch/roll (`rx=ry=0`), giữ yaw, mặt đáy phẳng nằm trên Z.
+- **📐 Mặt phẳng dốc (Plane)**: tính toán phương trình mặt phẳng dốc $Z = aX + bY + c$ từ point cloud. Đáy cuboid sẽ biến thiên linh hoạt theo từng tọa độ $(X, Y)$ khi xe chạy lên/xuống dốc, đồng thời tự động căn góc nghiêng Roll/Pitch theo đúng độ dốc mặt đường.
+
+### 5.3.1. Mặt phẳng dốc 3D (Ground Plane Fitting)
+
+Khi làm việc trên các đoạn đường dốc, đèo, cầu hoặc dốc nghiêng vỉa hè:
+
+1. Bấm **📐 Tính Plane dốc**: Thuật toán quét các điểm point cloud mặt đường quanh xe, giải hệ phương trình bình phương tối thiểu tìm phương trình mặt phẳng $Z = aX + bY + c$ và góc dốc (độ).
+2. Tích chọn **Tự căn góc dốc (Pitch/Roll)** nếu muốn thân xe tự động nghiêng theo độ dốc của mặt đường.
+3. Bấm **🏔️ Fit theo Plane** (hoặc chọn chế độ *Mặt phẳng dốc* rồi bấm *Fit mặt đất* / `Alt+G`): Tool sẽ tự tính toán cao độ đáy và góc nghiêng chuẩn xác cho từng frame trong toàn dải.
 
 **Phạm vi**
 

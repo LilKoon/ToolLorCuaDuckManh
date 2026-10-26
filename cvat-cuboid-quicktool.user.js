@@ -1,12 +1,17 @@
 // ==UserScript==
 // @name         CVAT Cuboid Toolbox (3D)
 // @namespace    https://github.com/vantixapps/cvat-tools
-// @version      2.4.0
+// @version      2.5.0
 // @description  Toolbox 3D cuboid cho CVAT: LWH/preset, fit mặt đất theo point cloud, track tools, QA, snapshot.
 // @author       Antigravity
 // @match        https://cvat-test.vantixapps.net/*
+// @match        https://app.cvat.ai/*
 // @match        http://localhost:8080/*
 // @match        http://127.0.0.1:8080/*
+// @match        http://localhost:*/*
+// @match        http://127.0.0.1:*/*
+// @include      *://*/jobs/*
+// @include      *://*cvat*/*
 // @grant        none
 // @inject-into  page
 // @run-at       document-idle
@@ -15,7 +20,7 @@
 (function () {
   'use strict';
 
-  console.log('[CVAT-Toolbox] Khởi động v2.4.0');
+  console.log('[CVAT-Toolbox] Khởi động v2.5.0');
 
   // =========================================================================
   // CSS
@@ -309,8 +314,34 @@
     return points[2] - lowestOffset(points);
   }
 
-  function fitPointsToGround(points, groundZ, mode) {
+  function getAnglesForPlane(a, b, rz) {
+    const norm = Math.hypot(a, b, 1);
+    const nx = -a / norm;
+    const ny = -b / norm;
+    const cos_rz = Math.cos(rz);
+    const sin_rz = Math.sin(rz);
+    const nyaw_x = nx * cos_rz + ny * sin_rz;
+    const nyaw_y = -nx * sin_rz + ny * cos_rz;
+    const ry = Math.asin(Math.max(-1.0, Math.min(1.0, nyaw_x)));
+    const cos_ry = Math.cos(ry);
+    const rx = Math.abs(cos_ry) > 1e-6
+      ? Math.asin(Math.max(-1.0, Math.min(1.0, -nyaw_y / cos_ry)))
+      : 0.0;
+    return { rx, ry };
+  }
+
+  function fitPointsToGround(points, groundZ, mode, planeInfo, autoTilt) {
     const p = points.slice();
+    if (mode === 'plane' && planeInfo) {
+      const gz = planeInfo.a * p[0] + planeInfo.b * p[1] + planeInfo.c;
+      if (autoTilt) {
+        const angles = getAnglesForPlane(planeInfo.a, planeInfo.b, p[5]);
+        p[3] = angles.rx;
+        p[4] = angles.ry;
+      }
+      p[2] = gz + lowestOffset(p);
+      return p;
+    }
     if (mode === 'flat') {
       p[3] = 0;
       p[4] = 0;
@@ -339,6 +370,61 @@
     const sorted = [...values].sort((a, b) => a - b);
     const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * p)));
     return sorted[idx];
+  }
+
+  // =========================================================================
+  // Kiểm tra 2 cuboid có chồng lấn (3D overlap / IoU > 0) hay không
+  // =========================================================================
+  function checkBoxesOverlap(p1, p2) {
+    // 1. Kiểm tra dải Z (cao độ)
+    const z1Min = bottomZ(p1);
+    const z1Max = z1Min + Math.abs(p1[8]);
+    const z2Min = bottomZ(p2);
+    const z2Max = z2Min + Math.abs(p2[8]);
+    if (z1Min >= z2Max - 0.05 || z2Min >= z1Max - 0.05) return false;
+
+    // 2. Lọc nhanh khoảng cách tâm XY
+    const dx = p1[0] - p2[0];
+    const dy = p1[1] - p2[1];
+    const r1 = 0.5 * Math.hypot(p1[6], p1[7]);
+    const r2 = 0.5 * Math.hypot(p2[6], p2[7]);
+    if (dx * dx + dy * dy >= (r1 + r2) * (r1 + r2)) return false;
+
+    // 3. Kiểm tra SAT (Separating Axis Theorem) cho hình chữ nhật xoay 2D
+    const getCorners = (p) => {
+      const cos = Math.cos(p[5]), sin = Math.sin(p[5]);
+      const hl = Math.abs(p[6]) / 2, hw = Math.abs(p[7]) / 2;
+      return [
+        [p[0] + hl * cos - hw * sin, p[1] + hl * sin + hw * cos],
+        [p[0] + hl * cos + hw * sin, p[1] + hl * sin - hw * cos],
+        [p[0] - hl * cos + hw * sin, p[1] - hl * sin - hw * cos],
+        [p[0] - hl * cos - hw * sin, p[1] - hl * sin + hw * cos],
+      ];
+    };
+    const c1 = getCorners(p1);
+    const c2 = getCorners(p2);
+    const axes = [
+      [Math.cos(p1[5]), Math.sin(p1[5])],
+      [-Math.sin(p1[5]), Math.cos(p1[5])],
+      [Math.cos(p2[5]), Math.sin(p2[5])],
+      [-Math.sin(p2[5]), Math.cos(p2[5])],
+    ];
+    for (const [ax, ay] of axes) {
+      let min1 = Infinity, max1 = -Infinity;
+      for (const [x, y] of c1) {
+        const val = x * ax + y * ay;
+        if (val < min1) min1 = val;
+        if (val > max1) max1 = val;
+      }
+      let min2 = Infinity, max2 = -Infinity;
+      for (const [x, y] of c2) {
+        const val = x * ax + y * ay;
+        if (val < min2) min2 = val;
+        if (val > max2) max2 = val;
+      }
+      if (min1 > max2 + 0.02 || min2 > max1 + 0.02) return false;
+    }
+    return true;
   }
 
   // =========================================================================
@@ -412,6 +498,66 @@
     const z = median(cluster);
 
     return { z, count: source.length, radius: rOut };
+  }
+
+  // Ước lượng mặt phẳng dốc Z = a*X + b*Y + c từ point cloud quanh object
+  function estimateGroundPlaneFromCloud(points, positions) {
+    const cx = points[0];
+    const cy = points[1];
+    const l = Math.abs(points[6]);
+    const w = Math.abs(points[7]);
+    const rz = points[5];
+    const halfDiag = 0.5 * Math.hypot(l, w);
+    const rOut = halfDiag + 4.5;
+
+    const cos = Math.cos(-rz);
+    const sin = Math.sin(-rz);
+    const insideX = l / 2 + 0.3;
+    const insideY = w / 2 + 0.3;
+
+    const ring = [];
+    for (let i = 0; i + 2 < positions.length; i += 3) {
+      const px = positions[i];
+      const py = positions[i + 1];
+      const pz = positions[i + 2];
+      if (!Number.isFinite(pz)) continue;
+
+      const dx = px - cx;
+      const dy = py - cy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > rOut * rOut) continue;
+
+      const lx = dx * cos - dy * sin;
+      const ly = dx * sin + dy * cos;
+      if (Math.abs(lx) <= insideX && Math.abs(ly) <= insideY) continue;
+
+      ring.push([px, py, pz]);
+    }
+
+    if (ring.length < 15) return null;
+
+    ring.sort((a, b) => a[2] - b[2]);
+    const cut = ring[Math.floor(ring.length * 0.35)][2] + 0.15;
+    const groundPts = ring.filter((p) => p[2] <= cut);
+    if (groundPts.length < 10) return null;
+
+    const N = groundPts.length;
+    let sx = 0, sy = 0, sz = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0;
+    for (const [x, y, z] of groundPts) {
+      sx += x; sy += y; sz += z;
+      sxx += x * x; syy += y * y; sxy += x * y;
+      sxz += x * z; syz += y * z;
+    }
+
+    const det = sxx * (syy * N - sy * sy) - sxy * (sxy * N - sy * sx) + sx * (sxy * sy - syy * sx);
+    if (Math.abs(det) < 1e-12) return null;
+
+    const a = (sxz * (syy * N - sy * sy) - sxy * (syz * N - sy * sz) + sx * (syz * sy - syy * sz)) / det;
+    const b = (sxx * (syz * N - sy * sz) - sxz * (sxy * N - sy * sx) + sx * (sxy * sz - syz * sx)) / det;
+    const c = (sxx * (syy * sz - sy * syz) - sxy * (sxy * sz - sy * sxz) + sxz * (sxy * sy - syy * sx)) / det;
+
+    const slopeDeg = Math.atan(Math.hypot(a, b)) * 180 / Math.PI;
+    return { a, b, c, slopeDeg, count: groundPts.length, radius: rOut };
   }
 
   // =========================================================================
@@ -1034,9 +1180,30 @@
                 <select id="cqt-ground-mode" class="cqt-input">
                   <option value="snap">Snap đáy (giữ nghiêng)</option>
                   <option value="flat">Đặt phẳng đáy</option>
+                  <option value="plane">📐 Mặt phẳng dốc (Plane)</option>
                 </select>
               </div>
             </div>
+
+            <div class="cqt-divider"></div>
+            <div class="cqt-label" style="font-weight:600;color:#fff;">Mặt phẳng dốc (Ground Plane 3D)</div>
+            <div class="cqt-row">
+              <button id="cqt-btn-calc-plane" class="cqt-btn cqt-btn-secondary" title="Tính phương trình mặt phẳng dốc Z=aX+bY+c từ point cloud quanh object">
+                📐 Tính Plane dốc
+              </button>
+              <button id="cqt-btn-apply-plane" class="cqt-btn cqt-btn-ground" title="Fit cuboid bám theo mặt phẳng dốc Z=aX+bY+c cho toàn dải frame">
+                🏔️ Fit theo Plane
+              </button>
+            </div>
+            <div id="cqt-plane-display" style="font-size:11px;color:#94a3b8;margin-bottom:6px;">
+              Plane: (chưa tính - bấm "Tính Plane dốc")
+            </div>
+            <div class="cqt-check-row" style="margin-bottom:6px;">
+              <label class="cqt-check" style="font-size:11px;color:#cbd5e1;" title="Tự động tính góc nghiêng Roll/Pitch để thân xe ôm sát mặt dốc">
+                <input type="checkbox" id="cqt-plane-tilt" checked /> Tự căn góc dốc (Pitch/Roll)
+              </label>
+            </div>
+            <div class="cqt-divider"></div>
 
             <div class="cqt-row">
               <div class="cqt-col">
@@ -1126,6 +1293,20 @@
 
           <!-- ================= QA ================= -->
           <div class="cqt-pane" data-pane="qa">
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;font-size:11px;color:#cbd5e1;">
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Kiểm tra kích thước L/W/H có bị đổi giữa các frame của cùng 1 track">
+                <input type="checkbox" id="cqt-qa-check-scale" checked /> Scale lệch
+              </label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Kiểm tra yaw nhảy đột ngột >75 độ giữa 2 frame liên tiếp">
+                <input type="checkbox" id="cqt-qa-check-yaw" checked /> Đổi hướng
+              </label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Kiểm tra va chạm / chồng lấn 3D giữa các box trong cùng frame">
+                <input type="checkbox" id="cqt-qa-check-overlap" checked /> Chồng lấn
+              </label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Kiểm tra object cách gốc lidar > 75m">
+                <input type="checkbox" id="cqt-qa-check-dist" checked /> Quá xa (>75m)
+              </label>
+            </div>
             <button id="cqt-btn-qa-scan" class="cqt-btn">🔎 Quét QA toàn dải</button>
             <pre id="cqt-qa-result" class="cqt-log">Chưa quét. Bấm "Quét QA".</pre>
             <button id="cqt-btn-qa-export" class="cqt-btn cqt-btn-secondary">📤 Export CSV</button>
@@ -1370,6 +1551,8 @@
     wrapper.querySelector('#cqt-btn-clear-keyframes').addEventListener('click', () => clearKeyframes());
 
     // ----- Ground tab -----
+    wrapper.querySelector('#cqt-btn-calc-plane')?.addEventListener('click', () => calcGroundPlane());
+    wrapper.querySelector('#cqt-btn-apply-plane')?.addEventListener('click', () => applyGroundPlaneFit());
     wrapper.querySelector('#cqt-btn-ground-cloud').addEventListener('click', () => estimateGroundFromCloud());
     wrapper.querySelector('#cqt-btn-ground-others').addEventListener('click', () => estimateGroundFromOthers());
     wrapper.querySelector('#cqt-btn-ground-from-box').addEventListener('click', () => setGroundFromCurrentBox());
@@ -1893,7 +2076,11 @@
   }
 
   function normalizeClass(value) {
-    return String(value ?? '').trim().toLowerCase();
+    let s = String(value ?? '').trim().toLowerCase().replace(/[\s_-]+/g, '_');
+    if (s.endsWith('ers')) s = s.slice(0, -3);
+    else if (s.endsWith('er')) s = s.slice(0, -2);
+    else if (s.endsWith('s') && !s.endsWith('ss')) s = s.slice(0, -1);
+    return s;
   }
 
   function getLimitsForLabel(label) {
@@ -2586,6 +2773,110 @@
   // =========================================================================
   // Ground features
   // =========================================================================
+  // =========================================================================
+  // Ground Plane 3D features
+  // =========================================================================
+  let activeGroundPlane = null;
+
+  async function calcGroundPlane() {
+    const id = resolveTargetId();
+    if (!Number.isInteger(id)) return setStatus('⚠️ Chọn object trước!', 'error');
+    const frame = getFrameNumber() || 0;
+    const s = await getCurrentState(id, frame);
+    if (!s?.points || s.points.length < 9) {
+      return setStatus(`⚠️ Không thấy cuboid #${id} ở frame ${frame}.`, 'error');
+    }
+    const positions = getPointCloudPositions();
+    if (!positions) {
+      return setStatus('⚠️ Không đọc được point cloud.', 'error');
+    }
+    const plane = estimateGroundPlaneFromCloud(s.points, positions);
+    if (!plane) {
+      return setStatus('⚠️ Không đủ điểm cloud để fit mặt phẳng dốc.', 'error');
+    }
+
+    activeGroundPlane = plane;
+    const disp = document.querySelector('#cqt-plane-display');
+    const aStr = (plane.a >= 0 ? '+' : '') + plane.a.toFixed(4);
+    const bStr = (plane.b >= 0 ? '+' : '') + plane.b.toFixed(4);
+    const cStr = (plane.c >= 0 ? '+' : '') + plane.c.toFixed(3);
+    const text = `Plane: Z = ${aStr}·X ${bStr}·Y ${cStr} (dốc ${plane.slopeDeg.toFixed(1)}°, ${plane.count} điểm)`;
+    if (disp) disp.textContent = text;
+
+    // Cập nhật cao độ Z tại tâm box vào ô input
+    const currentZ = plane.a * s.points[0] + plane.b * s.points[1] + plane.c;
+    const gzInput = document.querySelector('#cqt-ground-z');
+    if (gzInput) gzInput.value = currentZ.toFixed(3);
+
+    const modeSelect = document.querySelector('#cqt-ground-mode');
+    if (modeSelect) modeSelect.value = 'plane';
+
+    setStatus(`📐 Đã tính ${text}. Bấm "Fit theo Plane" để áp dụng.`, 'success');
+  }
+
+  async function applyGroundPlaneFit() {
+    if (!activeGroundPlane) {
+      await calcGroundPlane();
+      if (!activeGroundPlane) return;
+    }
+
+    const range = readRange();
+    if (!range) return;
+
+    const { jobInstance } = getCvatContext();
+    if (!jobInstance) return setStatus('⚠️ Chưa kết nối CVAT Job!', 'error');
+
+    const scope = val('cqt-ground-scope') || 'keyframes';
+    const autoTilt = !!document.querySelector('#cqt-plane-tilt')?.checked;
+    const currentFrame = getFrameNumber() || 0;
+    let from = range.startFrame;
+    let to = range.endFrame;
+    if (scope === 'current') {
+      from = currentFrame;
+      to = currentFrame;
+    }
+
+    setStatus(`⏳ Fit theo Plane dốc #${range.targetId} (frame ${from}–${to})...`);
+
+    const snap = [];
+    let changed = 0;
+    let scanned = 0;
+
+    for (let f = from; f <= to; f++) {
+      const s = await getCurrentState(range.targetId, f);
+      if (!s?.points || s.points.length < 9 || s.outside) continue;
+      scanned++;
+      if (scope === 'keyframes' && !s.keyframe) continue;
+
+      const before = [...s.points];
+      const after = fitPointsToGround(before, 0, 'plane', activeGroundPlane, autoTilt);
+      const dz = after[2] - before[2];
+      const dRot = Math.hypot(after[3] - before[3], after[4] - before[4]);
+      if (Math.abs(dz) < 1e-6 && dRot < 1e-6) continue;
+
+      snap.push(snapshotItem(s, f));
+      s.points = after;
+      saveState(s, jobInstance);
+      changed++;
+    }
+
+    if (!changed) {
+      if (!scanned) return setStatus(`⚠️ Không thấy #${range.targetId} trong dải.`, 'error');
+      return setStatus('ℹ️ Không có frame nào cần thay đổi.', 'success');
+    }
+
+    pushSnapshot('Fit plane dốc', snap);
+    const restored = await refreshCanvas();
+
+    setStatus(
+      `🏔️ Đã fit theo Plane dốc (${activeGroundPlane.slopeDeg.toFixed(1)}°) #${range.targetId}: ${changed} frame.` +
+      (autoTilt ? ' Đã tự căn góc Roll/Pitch.' : '') +
+      ' Ctrl+S để lưu.' +
+      (restored ? '' : ' ⚠️ Chưa tự về frame cũ.'),
+      'success'
+    );
+  }
+
   async function estimateGroundFromCloud() {
     const id = resolveTargetId();
     if (!Number.isInteger(id)) return setStatus('⚠️ Chọn object trước!', 'error');
@@ -2741,6 +3032,9 @@
     if (!Number.isFinite(groundZ)) return setStatus('⚠️ Cao độ mặt đất không hợp lệ!', 'error');
 
     const mode = val('cqt-ground-mode') || 'snap';
+    if (mode === 'plane') {
+      return applyGroundPlaneFit();
+    }
     const scope = val('cqt-ground-scope') || 'keyframes';
     const direction = val('cqt-ground-direction') || 'both';
 
@@ -3175,6 +3469,11 @@
     const { jobInstance } = getCvatContext();
     if (!jobInstance) return setStatus('⚠️ Chưa kết nối CVAT Job!', 'error');
 
+    const checkScale = !!document.querySelector('#cqt-qa-check-scale')?.checked;
+    const checkYaw = !!document.querySelector('#cqt-qa-check-yaw')?.checked;
+    const checkOverlap = !!document.querySelector('#cqt-qa-check-overlap')?.checked;
+    const checkDist = !!document.querySelector('#cqt-qa-check-dist')?.checked;
+
     setStatus('⏳ Đang quét QA...');
     const byId = new Map();
 
@@ -3183,8 +3482,11 @@
         setStatus(`⏳ QA: frame ${f}/${range.endFrame}...`);
       }
       const states = await jobInstance.annotations.get(f, true);
+      const activeStates = [];
+
       for (const s of states) {
         if (!s.points || s.points.length < 9 || s.outside) continue;
+        activeStates.push(s);
 
         let rec = byId.get(s.clientID);
         if (!rec) {
@@ -3203,6 +3505,11 @@
             maxH: -Infinity,
             first: f,
             last: f,
+            lastFrame: null,
+            lastYaw: null,
+            yawFlips: [],
+            overlaps: new Set(),
+            maxDist: 0,
           };
           byId.set(s.clientID, rec);
         }
@@ -3210,17 +3517,54 @@
         rec.frames++;
         rec.last = f;
         if (s.keyframe) rec.keyframes++;
+
+        // Đo khoảng cách đáy so với groundZ
         if (Number.isFinite(groundZ)) {
           const gap = bottomZ(s.points) - groundZ;
           rec.minGap = Math.min(rec.minGap, gap);
           rec.maxGap = Math.max(rec.maxGap, gap);
         }
+
+        // Kích thước LWH
         rec.minL = Math.min(rec.minL, s.points[6]);
         rec.maxL = Math.max(rec.maxL, s.points[6]);
         rec.minW = Math.min(rec.minW, s.points[7]);
         rec.maxW = Math.max(rec.maxW, s.points[7]);
         rec.minH = Math.min(rec.minH, s.points[8]);
         rec.maxH = Math.max(rec.maxH, s.points[8]);
+
+        // Khoảng cách tới tâm cảm biến LiDAR (gốc 0,0)
+        const dist = Math.hypot(s.points[0], s.points[1]);
+        if (dist > rec.maxDist) rec.maxDist = dist;
+
+        // Đổi hướng đột ngột (yaw flip > 75 độ giữa 2 frame liên tiếp)
+        if (checkYaw && rec.lastFrame === f - 1 && Number.isFinite(rec.lastYaw)) {
+          let diff = Math.abs(s.points[5] - rec.lastYaw);
+          while (diff > Math.PI) diff = Math.abs(diff - 2 * Math.PI);
+          if (diff > (75 * Math.PI / 180)) {
+            rec.yawFlips.push({
+              from: f - 1,
+              to: f,
+              deg: Math.round(diff * 180 / Math.PI),
+            });
+          }
+        }
+        rec.lastFrame = f;
+        rec.lastYaw = s.points[5];
+      }
+
+      // Kiểm tra chồng lấn giữa các object trong cùng frame f
+      if (checkOverlap && activeStates.length > 1) {
+        for (let i = 0; i < activeStates.length; i++) {
+          for (let j = i + 1; j < activeStates.length; j++) {
+            const s1 = activeStates[i];
+            const s2 = activeStates[j];
+            if (checkBoxesOverlap(s1.points, s2.points)) {
+              byId.get(s1.clientID)?.overlaps.add(s2.clientID);
+              byId.get(s2.clientID)?.overlaps.add(s1.clientID);
+            }
+          }
+        }
       }
     }
 
@@ -3235,11 +3579,39 @@
     for (const rec of byId.values()) {
       const issues = [];
 
+      // 1. Kiểm tra lún/bay so với groundZ
       const gapAbs = Number.isFinite(rec.minGap)
         ? Math.max(Math.abs(rec.minGap), Math.abs(rec.maxGap))
         : null;
       if (gapAbs !== null && gapAbs > 0.05) issues.push(`đáy lệch ${gapAbs.toFixed(2)}m`);
 
+      // 2. Kiểm tra Scale không đồng bộ trong cùng 1 track
+      const dL = rec.maxL - rec.minL;
+      const dW = rec.maxW - rec.minW;
+      const dH = rec.maxH - rec.minH;
+      const maxDelta = Math.max(dL, dW, dH);
+      if (checkScale && maxDelta > 0.02) {
+        issues.push(`scale lệch trong track (chênh ${maxDelta.toFixed(2)}m)`);
+      }
+
+      // 3. Kiểm tra đổi hướng đột ngột
+      if (checkYaw && rec.yawFlips.length) {
+        const top = rec.yawFlips.slice(0, 2).map((y) => `${y.deg}° tại f${y.to}`).join(', ');
+        issues.push(`đổi hướng đột ngột (${top})`);
+      }
+
+      // 4. Kiểm tra chồng lấn
+      if (checkOverlap && rec.overlaps.size) {
+        const list = [...rec.overlaps].slice(0, 3).map((id) => `#${id}`).join(', ');
+        issues.push(`chồng lấn với ${list}`);
+      }
+
+      // 5. Kiểm tra khoảng cách quá xa (> 75m)
+      if (checkDist && rec.maxDist > 75) {
+        issues.push(`quá xa (${rec.maxDist.toFixed(0)}m > 75m)`);
+      }
+
+      // 6. Kiểm tra độ lệch kích thước so với mẫu chuẩn (Preset / Limits)
       let sizeDev = null;
       const preset = presets[rec.label];
       const lim = getLimitsForLabel(rec.label);
@@ -3258,6 +3630,7 @@
         if (sizeDev > 0.25) issues.push(`size lệch ${(sizeDev * 100).toFixed(0)}%`);
       }
 
+      // 7. Kiểm tra ngoài limits
       if (lim) {
         const avgL = (rec.maxL + rec.minL) / 2;
         const avgW = (rec.maxW + rec.minW) / 2;
@@ -3269,6 +3642,7 @@
         ) issues.push('ngoài limits LWH');
       }
 
+      // 8. Keyframe quá dày / track quá ngắn
       if (rec.frames > 10 && rec.keyframes / rec.frames > 0.8) issues.push('keyframe quá dày');
       if (rec.frames < 3) issues.push('track quá ngắn');
 
@@ -3302,11 +3676,14 @@
       '.';
 
     const body = lines.length
-      ? lines.slice(0, 40).join('\n') + (lines.length > 40 ? `\n... +${lines.length - 40} dòng` : '')
+      ? lines.slice(0, 40).join('\n') + (lines.length > 40 ? `
+... +${lines.length - 40} dòng` : '')
       : 'Không phát hiện vấn đề.';
 
     const pre = document.querySelector('#cqt-qa-result');
-    if (pre) pre.textContent = `${header}\n\n${body}`;
+    if (pre) pre.textContent = `${header}
+
+${body}`;
 
     setStatus(header, withIssues ? 'warn' : 'success');
   }
