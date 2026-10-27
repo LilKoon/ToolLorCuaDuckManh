@@ -72,6 +72,7 @@
   const DEFAULT_SETTINGS = {
     blenderKeys: true, // G/W/S, Numpad 7/1/3/. trên canvas 3D
     bounceRefresh: false, // làm mới canvas bằng cách chuyển frame (chậm, dự phòng)
+    enforceLimits: false, // ép LWH vào limits khi Áp dụng LWH / auto-fix (tắt = limits chỉ để cảnh báo)
   };
 
   function lsGet(key, fallback) {
@@ -1334,7 +1335,7 @@
     );
   }
 
-  // Kẹp LWH theo limits của class nếu bật "Tự clamp"
+  // Kẹp LWH theo limits của class nếu bật "Ép theo limits" (mặc định tắt: limits chỉ cảnh báo)
   async function clampLWHInputs(id, lwh) {
     if (!isChecked('cqt-limit-clamp-on-apply')) return { ...lwh, note: '' };
     const s = await getState(id, getFrame());
@@ -2477,7 +2478,8 @@
 
   function planSizeFix(rec, opts) {
     const m = trackMedianLWH(rec);
-    const lim = opts.limits ? getLimitsForLabel(rec.label) : null;
+    // Chỉ kẹp limits khi bật "Ép theo limits"; tắt thì chỉ đồng bộ về median của track
+    const lim = getSettings().enforceLimits ? getLimitsForLabel(rec.label) : null;
     const t = lim ? clampLWH(m.l, m.w, m.h, lim) : m;
     const clamped = !sameLWH([0, 0, 0, 0, 0, 0, m.l, m.w, m.h], t.l, t.w, t.h, 1e-9);
     const frames = rec.frames.filter((x) => x.keyframe && !sameLWH(x.points, t.l, t.w, t.h, 1e-4)).map((x) => x.frame);
@@ -2840,11 +2842,16 @@
     if (types.has('duplicateTrack')) ops.push(...planDuplicateTrackFix(data, rows, idPool));
     if (types.has('unknownClass')) ops.push(...planUnknownClassFix(data, rows));
     if (types.has('size')) {
-      const ids = new Set([...flagged(QA_TYPES.scale), ...flagged(QA_TYPES.limits)]);
+      // Track chỉ ngoài limits (không lệch scale) có thể hợp lệ (vd. người đang cúi) => chỉ đề xuất khi bật ép limits, mặc định không tick
+      const scaleIds = flagged(QA_TYPES.scale);
+      const enforce = getSettings().enforceLimits;
+      const ids = new Set([...scaleIds, ...(enforce ? flagged(QA_TYPES.limits) : [])]);
       for (const id of ids) {
         const op = planSizeFix(data.tracks.get(id), opts);
-        if (op) ops.push(op);
-        else manualNote('size', id, 'Size lệch nhưng mọi keyframe đã đúng chuẩn');
+        if (op) {
+          if (!scaleIds.has(id)) op.checked = false;
+          ops.push(op);
+        } else if (scaleIds.has(id)) manualNote('size', id, 'Size lệch nhưng mọi keyframe đã đúng chuẩn');
       }
     }
     if (types.has('yaw')) {
@@ -3851,7 +3858,7 @@
             <button id="cqt-btn-limit-save" class="cqt-btn">💾 Lưu limits</button>
             <button id="cqt-btn-limit-reset" class="cqt-btn cqt-btn-secondary">↺ Tiêu chuẩn</button>
           </div>
-          <label class="cqt-check"><input type="checkbox" id="cqt-limit-clamp-on-apply" checked /> Tự kẹp khi Áp dụng LWH</label>
+          <label class="cqt-check"><input type="checkbox" id="cqt-limit-clamp-on-apply" /> Ép theo limits khi Áp dụng LWH / auto-fix (tắt = chỉ cảnh báo)</label>
           <div class="cqt-divider"></div>
           <span class="cqt-h">Cả class</span>
           <label class="cqt-check"><input type="checkbox" id="cqt-limit-class-all-job" checked /> Quét toàn job (bỏ chọn = dải Start–End)</label>
@@ -3894,6 +3901,7 @@
     const s = getSettings();
     $('cqt-set-blender').checked = s.blenderKeys;
     $('cqt-set-bounce').checked = s.bounceRefresh;
+    $('cqt-limit-clamp-on-apply').checked = s.enforceLimits;
 
     const job = getJob();
     const frame = getFrame();
@@ -4058,9 +4066,11 @@
     const saveSettings = () => lsSet(LS.settings, {
       blenderKeys: isChecked('cqt-set-blender'),
       bounceRefresh: isChecked('cqt-set-bounce'),
+      enforceLimits: isChecked('cqt-limit-clamp-on-apply'),
     });
     on('cqt-set-blender', saveSettings, 'change');
     on('cqt-set-bounce', saveSettings, 'change');
+    on('cqt-limit-clamp-on-apply', saveSettings, 'change');
     on('cqt-limit-class', () => { setField('cqt-limit-class-name', ''); loadLimitForm(val('cqt-limit-class')); }, 'change');
     on('cqt-btn-limit-save', saveLimitForm);
     on('cqt-btn-limit-delete', deleteLimitClass);
