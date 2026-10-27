@@ -379,15 +379,16 @@ Thêm keyframe mỗi `N` frame trong dải. Có confirm vì có thể tạo rấ
 
 Quét **tất cả cuboid** trong dải frame (Start–End) và tổng hợp:
 
-| Kiểm tra | Ngưỡng & Trạng thái |
-|---|---|
-| Scale lệch trong track | Chênh L/W/H > 0.02m (Mặc định BẬT) |
-| Đổi hướng đột ngột | Nhảy yaw > 75° (Mặc định BẬT, tùy chỉnh được ngưỡng độ) |
-| Ngoài limits LWH | Bất kỳ chiều nào ngoài min/max class (Mặc định BẬT) |
-| Đáy lệch so với Ground Z | > 5 cm |
-| Size lệch so với preset / midpoint | > 25% |
-| Chồng lấn 3D (SAT) | Va chạm giữa 2 box (**Tùy chọn / Optional - Mặc định TẮT**) |
-| Quá xa gốc LiDAR | Khoảng cách > 100m (**Tùy chọn / Optional - Mặc định TẮT**) |
+| Kiểm tra | Ngưỡng & Trạng thái | Auto-Fix |
+|---|---|---|
+| Thiếu track_id | Cuboid không có track_id (Mặc định BẬT) | Gán thuộc tính track_id (nối với box kề cùng nhóm ≤ 2.5m, không thì cấp ID mới, không cấp trùng). Shape mà label không có thuộc tính track_id: báo sửa tay |
+| Trùng track_id trong 1 frame | Cùng ID ≥ 2 box/frame (Mặc định BẬT) | Box ma: đặt outside đúng các frame trùng (không xoá). Khác vị trí: cấp track_id mới cho object sau |
+| Class không nhận dạng | Nhãn ngoài class_groups (Mặc định BẬT) | Đổi sang label có thật trong job cùng nhóm (mặc định không tick) |
+| Scale lệch trong track | Chênh L/W/H > 0.005m (Mặc định BẬT) | Đồng bộ theo kích thước median chuẩn |
+| Đổi hướng đột ngột | Nhảy yaw > 75° (Mặc định BẬT, chỉnh được) | Lật lại đầu xe bị ngược 180° |
+| Ngoài limits LWH | Kích thước ngoài min/max class | Kẹp LWH về khoảng min/max chuẩn |
+| Chồng lấn 3D (SAT) | Va chạm giữa 2 box (**Tùy chọn - TẮT**) | Báo chi tiết cặp trùng để sửa tay |
+| Quá xa gốc LiDAR | Khoảng cách > 100m (**Tùy chọn - TẮT**) | Ngắt outside các frame ngoài tầm |
 
 Kết quả hiện thành các **thẻ tương tác (Interactive Cards)** trực quan:
 - **🎯 Xem frame X**: Bấm vào để CVAT tự động nhảy ngay tới frame bị lỗi và focus vào object đó trên 3D canvas.
