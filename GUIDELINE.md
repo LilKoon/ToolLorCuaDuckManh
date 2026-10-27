@@ -379,29 +379,43 @@ Thêm keyframe mỗi `N` frame trong dải. Có confirm vì có thể tạo rấ
 
 Quét **tất cả cuboid** trong dải frame (Start–End) và tổng hợp:
 
-| Kiểm tra | Ngưỡng |
+| Kiểm tra | Ngưỡng & Trạng thái |
 |---|---|
+| Scale lệch trong track | Chênh L/W/H > 0.02m (Mặc định BẬT) |
+| Đổi hướng đột ngột | Nhảy yaw > 75° (Mặc định BẬT, tùy chỉnh được ngưỡng độ) |
+| Ngoài limits LWH | Bất kỳ chiều nào ngoài min/max class (Mặc định BẬT) |
 | Đáy lệch so với Ground Z | > 5 cm |
-| Size lệch so với preset hoặc midpoint limits | > 25% |
-| Ngoài limits LWH | Bất kỳ chiều nào ngoài min/max |
-| Keyframe quá dày | > 80% số frame (track > 10 frame) |
-| Track quá ngắn | < 3 frame |
+| Size lệch so với preset / midpoint | > 25% |
+| Chồng lấn 3D (SAT) | Va chạm giữa 2 box (**Tùy chọn / Optional - Mặc định TẮT**) |
+| Quá xa gốc LiDAR | Khoảng cách > 100m (**Tùy chọn / Optional - Mặc định TẮT**) |
 
-Kết quả hiện trong khung; object có vấn đề xếp lên đầu. **Quét QA không sửa gì.**
+Kết quả hiện thành các **thẻ tương tác (Interactive Cards)** trực quan:
+- **🎯 Xem frame X**: Bấm vào để CVAT tự động nhảy ngay tới frame bị lỗi và focus vào object đó trên 3D canvas.
+- **⚡ Sửa xe này**: Tự động sửa lỗi riêng cho object đó (chuẩn hóa scale, lật đầu xoay ngược, kẹp limits, bám mặt đất).
 
-### 7.2. Export CSV
+### 7.2. Tự động sửa lỗi QA (Auto-Fix All)
+- Bấm nút **`⚡ Tự động sửa lỗi QA`** ngay cạnh nút quét.
+- Tool sẽ quét toàn bộ danh sách lỗi, tự động lưu Snapshot để có thể Undo bất cứ lúc nào, rồi sửa đồng loạt:
+  1. **Scale lệch**: Lấy kích thước trung vị (median) chuẩn hóa cho toàn bộ track.
+  2. **Đổi hướng đột ngột**: Tự động đảo lại các frame bị lộn ngược đầu $180^\circ$ hoặc nhảy góc.
+  3. **Ngoài Limits**: Kẹp kích thước $L, W, H$ về khoảng an toàn của class.
+  4. **Quá xa**: Ngắt ngoài tầm ($> 100	ext{m}$) nếu tùy chọn này được bật.
+  5. **Đáy lệch**: Căn chuẩn theo Ground Z nếu có mốc cao độ mặt đất.
+- Tự động quét lại QA và thông báo kết quả. Annotator chỉ việc bấm `Ctrl + S` để lưu vào CVAT!
+
+### 7.3. Export CSV
 
 Xuất các dòng QA ra `cvat_qa_<job>_<start>-<end>.csv` (UTF-8 BOM, mở được bằng Excel).
 
 Cột: `clientID,label,frames,keyframes,gap_min,gap_max,size_dev,issues`.
 
-### 7.3. Snapshot / Restore
+### 7.4. Snapshot / Restore
 
 - Chọn snapshot → **Restore** để khôi phục.
 - **Xoá tất cả snapshot** khi không cần.
 - Restore là best-effort: object đã bị xoá/đổi cấu trúc sẽ bị bỏ qua.
 
-### 7.4. Log
+### 7.5. Log
 
 Hiển thị 60 dòng thao tác gần nhất kèm giờ. Chỉ ghi các thao tác có trạng thái success/error/warn.
 
@@ -411,13 +425,12 @@ Hiển thị 60 dòng thao tác gần nhất kèm giờ. Chỉ ghi các thao tá
 
 ### 8.1. Ngưỡng mặc định
 
-| Class | L | W | H |
-|---|---|---|---|
-| `vehicle` | 3.2 – 5.5 | 1.6 – 2.2 | 1.5 – 1.9 |
-| `two_wheel` | 1.5 – 2.0 | 0.6 – 0.9 | 1.5 – 1.8 |
-| `pedestrian` | 0.65 – 1.0 | 0.65 – 1.0 | 1.2 – 1.9 |
+| Class | L | W | H | Ghi chú |
+|---|---|---|---|---|
+| `two_wheel` | 1.2 – 2.5 | 0.5 – 1.2 | 1.0 – 2.0 | Xe đạp, xe máy, xe điện |
+| `pedestrian` | 0.4 – 1.2 | 0.4 – 1.2 | 1.0 – 2.1 | Người đi bộ |
 
-Lần đầu chạy, 3 class này tự được tạo trong `localStorage` (`cqt_limits_v2`).
+> 💡 **Lưu ý về Class `vehicle`**: Giới hạn cứng của `vehicle` (trước đây là 5.5m × 2.2m × 1.9m) **đã được gỡ bỏ hoàn toàn**. Do thực tế bài gán nhãn có rất nhiều loại xe khác nhau (xe bán tải, xe cứu thương, van chở khách 5.76m, xe tải, xe buýt dài 10–12m), việc cố định 5.5m sẽ gây lỗi sai lệch kích thước thực tế. Người dùng có thể tự do nhập kích thước theo thực tế xe hoặc tự thêm các class cụ thể (`car`, `truck`, `bus`) trong tab Limits nếu cần.
 
 ### 8.2. Sửa / thêm / xoá
 
@@ -681,3 +694,32 @@ Trong CVAT, `savePoints` tại frame không phải keyframe sẽ tạo keyframe 
 | ⚡ Clamp toàn track | Limits | Kẹp cả track (tự dò dải) |
 | 🔎 Check class | Limits | Báo object/frame ngoài ngưỡng |
 | 📏 Clamp class | Limits | Kẹp mọi object của class |
+
+---
+
+## 🚀 Các tính năng "khắc phục triệt để nhược điểm của CVAT" (Mới nhất)
+
+### 1. 🧲 Nam châm Smart Snap (`Alt + S` / Nút `🧲 Smart Snap`)
+* **Cách dùng**: Đặt một chiếc box áng chừng gần chiếc xe, bấm phím tắt **`Alt + S`** hoặc click **`🧲 Smart Snap`**.
+* **Cơ chế**:
+  * Tự động quét cụm điểm LiDAR trong bán kính mở rộng quanh box.
+  * Chạy thuật toán **2D PCA** tìm trục dài chính xác của xe và xoay dáng xe thẳng tắp.
+  * Tính toán bao khít kích thước $L, W, H$ theo các phân vị 5% - 95% để lọc bỏ điểm rác/nhiễu.
+  * Tự động hạ đáy box chạm khít mặt đường (`Ground Z`).
+  * Chỉ mất **0.5 giây / 1 chiếc xe** thay vì phải ngồi nắn từng view mất cả phút!
+
+### 2. 🎯 Chọn nhiều Box cùng lúc (Multi-Select & Batch Actions)
+* **Cách chọn**:
+  * Giữ **`Shift` + Click** vào chiếc box trên khung hình 3D hoặc click vào dòng xe trên danh sách sidebar bên phải.
+  * Hoặc bấm **`Tất cả trong frame`** để chọn toàn bộ cuboid đang có trong frame hiện tại.
+* **Thao tác hàng loạt**:
+  * **🧲 Snap tất cả**: Tự động Smart Snap đồng loạt cho tất cả các box được chọn.
+  * **↕️ Hạ chạm đất**: Hạ đáy đồng loạt cho tất cả các box được chọn chạm mặt đất.
+  * **🗑️ Xoá chọn**: Xoá nhanh tất cả các box được chọn trong frame chỉ với 1 click.
+
+### 3. 🎥 Camera View Presets kiểu Blender (Phím tắt F, 1, 3, 7)
+* Thanh điều khiển góc nhìn đặt ngay dưới tiêu đề Toolbox:
+  * **`F` / `🎯 Focus`**: Camera tự động bay lại gần và căn thẳng trọng tâm vào chiếc xe đang chọn.
+  * **`7` (Numpad 7 / `Alt + 7`) / `🔝 Top`**: Nhìn thẳng từ trên nóc xe xuống (Top-down Bird's eye view).
+  * **`1` (Numpad 1 / `Alt + 1`) / `🚗 Front`**: Nhìn trực diện từ phía trước mũi xe.
+  * **`3` (Numpad 3 / `Alt + 3`) / `↔️ Side`**: Nhìn ngang sườn xe.
