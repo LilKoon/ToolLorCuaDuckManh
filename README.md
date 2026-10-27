@@ -7,7 +7,7 @@ Userscript Tampermonkey bổ sung toolbox hỗ trợ thao tác cuboid 3D trên C
 - Google Chrome.
 - Extension [Tampermonkey](https://www.tampermonkey.net/).
 - Một trang CVAT có địa chỉ khớp với một trong các địa chỉ được cấu hình trong script:
-  -  ....
+  - `...`
   - `http://localhost:8080/`
   - `http://127.0.0.1:8080/`
 
