@@ -4,7 +4,6 @@
 // @version      3.1.0
 // @description  Toolbox 3D cuboid cho CVAT: thao tác kiểu Blender, LWH/preset, mặt đất theo point cloud, track tools, QA + auto-fix có xem trước.
 // @author       Antigravity
-// @match        https://cvat-test.vantixapps.net/*
 // @match        https://app.cvat.ai/*
 // @match        http://localhost:8080/*
 // @match        http://127.0.0.1:8080/*
