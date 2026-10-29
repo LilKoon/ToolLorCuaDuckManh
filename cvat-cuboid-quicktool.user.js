@@ -66,6 +66,9 @@
     dist: true,
     distThresh: 100, // m, tính từ gốc toạ độ
     limits: true,
+    ground: false, // đọc cloud từng frame => chậm, mặc định tắt
+    groundTol: 0.05, // m, lệch đáy so với mặt đất cục bộ
+    groundAll: false, // false = chỉ keyframe (frame nội suy đi theo), true = mọi frame
     wholeJob: true,
   };
 
@@ -263,38 +266,83 @@
     return { a, b, c: mz - a * mx - b * my };
   }
 
-  // Ước lượng mặt đất cục bộ quanh hộp từ point cloud (vành khuyên quanh footprint, lọc dần outlier)
+  // Độ cao lớp mặt đất trong 1 vùng: đỉnh "tập trung điểm" thấp nhất của histogram Z.
+  // Mặt đường gồ ghề vẫn là 1 lớp điểm dày; thân xe, bó vỉa, nhiễu thì thưa hơn hoặc cao hơn.
+  function groundPeakZ(zs, minCount = 8) {
+    if (zs.length < minCount) return null;
+    const BIN = 0.02, NB = 75; // xét 1.5 m phía trên điểm thấp
+    const lo = percentile(zs, 0.01);
+    const hist = new Float64Array(NB);
+    for (const z of zs) {
+      const k = Math.floor((z - lo) / BIN);
+      if (k >= 0 && k < NB) hist[k]++;
+    }
+    const KER = [0.06, 0.24, 0.4, 0.24, 0.06]; // làm mượt ~4 cm
+    const sm = new Float64Array(NB);
+    let max = 0;
+    for (let k = 0; k < NB; k++) {
+      for (let j = 0; j < 5; j++) sm[k] += KER[j] * (hist[k + j - 2] || 0);
+      max = Math.max(max, sm[k]);
+    }
+    if (max < 2) return null;
+    let k = 0;
+    while (sm[k] < 0.5 * max) k++; // lớp dày đầu tiên tính từ dưới lên
+    while (k + 1 < NB && sm[k + 1] >= sm[k]) k++; // leo tới đỉnh của lớp đó
+    const zc = lo + (k + 0.5) * BIN;
+    let sum = 0, n = 0;
+    for (const z of zs) if (Math.abs(z - zc) <= 0.04) { sum += z; n++; }
+    return n ? { z: sum / n, n } : null;
+  }
+
+  // Mặt đất cục bộ dưới hộp. Không fit 1 plane lớn (đường gồ ghề làm lệch),
+  // mà đo độ cao lớp đất ngay tại 4 góc đáy (chỗ bánh xe), rồi nối 4 điểm đó thành mặt nghiêng.
   function estimateGroundPlane(points, positions) {
     const cx = points[0], cy = points[1];
     const l = Math.abs(points[6]), w = Math.abs(points[7]);
-    const rOut = 0.5 * Math.hypot(l, w) + 4.5;
-    const cos = Math.cos(-points[5]), sin = Math.sin(-points[5]);
-    const inX = l / 2 + 0.3, inY = w / 2 + 0.3;
+    const cos = Math.cos(points[5]), sin = Math.sin(points[5]);
+    const rOut = 0.5 * Math.hypot(l, w) + 2.5;
+    const bz = bottomZ(points);
 
-    const ring = [];
+    const near = []; // [lx, ly, z, inside]
     for (let i = 0; i + 2 < positions.length; i += 3) {
       const z = positions[i + 2];
-      if (!Number.isFinite(z)) continue;
+      if (!Number.isFinite(z) || z < bz - 3 || z > bz + 2) continue;
       const dx = positions[i] - cx, dy = positions[i + 1] - cy;
       if (dx * dx + dy * dy > rOut * rOut) continue;
-      const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
-      if (Math.abs(lx) <= inX && Math.abs(ly) <= inY) continue;
-      ring.push([positions[i], positions[i + 1], z]);
+      const lx = dx * cos + dy * sin, ly = -dx * sin + dy * cos;
+      near.push([lx, ly, z, Math.abs(lx) <= l / 2 + 0.3 && Math.abs(ly) <= w / 2 + 0.3]);
     }
-    if (ring.length < 15) return null;
+    // 1) Mức đất chung: lớp dày thấp nhất ngoài footprint
+    const ref = groundPeakZ(near.filter((q) => !q[3]).map((q) => q[2]), 15);
+    if (!ref) return null;
 
-    ring.sort((a, b) => a[2] - b[2]);
-    const cut = ring[Math.floor(ring.length * 0.35)][2] + 0.15;
-    let ground = ring.filter((q) => q[2] <= cut);
-    let plane = fitPlaneLSQ(ground);
-    for (let iter = 0; plane && iter < 3; iter++) {
-      const kept = ground.filter((q) => Math.abs(q[2] - planeZ(plane, q[0], q[1])) <= 0.12);
-      if (kept.length < 10 || kept.length === ground.length) break;
-      ground = kept;
-      plane = fitPlaneLSQ(ground) || plane;
+    // 2) Đo lại tại từng góc đáy, chỉ trong cửa sổ ±0.3 m quanh mức chung (bỏ thân xe, bó vỉa)
+    // Bán kính đo nhỏ dần từ trong ra: càng sát góc càng đúng chỗ bánh xe, chỉ nới rộng khi thiếu điểm
+    const band = near.filter((q) => Math.abs(q[2] - ref.z) <= 0.3);
+    const samples = [];
+    let count = 0;
+    for (const [ax, ay] of [[l / 2, w / 2], [l / 2, -w / 2], [-l / 2, w / 2], [-l / 2, -w / 2]]) {
+      let pk = null;
+      for (const r of [0.5, 0.8, 1.2, 1.6]) {
+        const zs = [];
+        for (const q of band) {
+          const dx = q[0] - ax, dy = q[1] - ay;
+          if (dx * dx + dy * dy <= r * r) zs.push(q[2]);
+        }
+        if (zs.length >= 12 && (pk = groundPeakZ(zs, 12))) break;
+      }
+      if (!pk) continue;
+      count += pk.n;
+      samples.push([cx + ax * cos - ay * sin, cy + ax * sin + ay * cos, pk.z]);
     }
-    if (!plane || ground.length < 10) return null;
-    return { ...plane, slopeDeg: Math.atan(Math.hypot(plane.a, plane.b)) * DEG, count: ground.length };
+    // Góc bị thân xe che mất đất thường cho đỉnh cao bất thường => bỏ góc cao hơn góc thấp nhất > 0.2 m
+    const zMin = Math.min(...samples.map((s) => s[2]));
+    const good = samples.filter((s) => s[2] - zMin <= 0.2);
+
+    let plane = good.length >= 3 ? fitPlaneLSQ(good) : null;
+    if (plane && Math.atan(Math.hypot(plane.a, plane.b)) * DEG > 12) plane = null; // dốc vô lý => coi như phẳng
+    if (!plane) plane = flatPlane(good.length ? median(good.map((s) => s[2])) : ref.z);
+    return { ...plane, slopeDeg: Math.atan(Math.hypot(plane.a, plane.b)) * DEG, count: count || ref.n, corners: good.length };
   }
 
   // =========================================================================
@@ -319,18 +367,111 @@
     return out;
   }
 
-  // Trục chính của cụm điểm trên mặt XY (mod π)
-  function pcaYaw(pts) {
-    const n = pts.length;
+  // Hướng hộp theo "L-shape fitting" (Zhang et al. 2017, tiêu chí closeness).
+  // Thử mọi góc θ trong [0°, 90°): chiếu điểm lên 2 trục e1 = (cosθ, sinθ), e2 = (−sinθ, cosθ)
+  // (tích vô hướng trên mặt XY), rồi chấm điểm mức độ điểm dồn sát các cạnh hộp.
+  // Đúng hướng thì 2 mặt LiDAR nhìn thấy nằm gọn trên 2 cạnh => điểm cao nhất.
+  // PCA bị lệch vì khi chỉ thấy 2 mặt (chữ L), trục chính chạy chéo theo đường chéo chữ L.
+  // priors: [{ yaw, w }] hướng các box xung quanh (so theo mod 90°), chỉ để phân xử khi cloud mơ hồ.
+  // Trả về { yaw (mod 90°), conf (0 = mơ hồ … 1 = rõ) }.
+  function fitRectYaw(pts, priors = []) {
+    const step = Math.max(1, Math.floor(pts.length / 1200));
+    const xy = [];
     let mx = 0, my = 0;
-    for (const q of pts) { mx += q[0]; my += q[1]; }
-    mx /= n; my /= n;
-    let sxx = 0, syy = 0, sxy = 0;
-    for (const q of pts) {
-      const dx = q[0] - mx, dy = q[1] - my;
-      sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    for (let i = 0; i < pts.length; i += step) { xy.push(pts[i]); mx += pts[i][0]; my += pts[i][1]; }
+    mx /= xy.length; my /= xy.length;
+    const X = xy.map((q) => q[0] - mx), Y = xy.map((q) => q[1] - my);
+    const n = X.length, D0 = 0.04;
+    const c1 = new Float64Array(n), c2 = new Float64Array(n);
+    const closeness = (t) => {
+      const c = Math.cos(t), s = Math.sin(t);
+      for (let i = 0; i < n; i++) { c1[i] = X[i] * c + Y[i] * s; c2[i] = -X[i] * s + Y[i] * c; }
+      const s1 = Array.from(c1).sort((a, b) => a - b), s2 = Array.from(c2).sort((a, b) => a - b);
+      const k0 = Math.floor(0.01 * (n - 1)), k1 = Math.ceil(0.99 * (n - 1));
+      const lo1 = s1[k0], hi1 = s1[k1], lo2 = s2[k0], hi2 = s2[k1];
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const d1 = Math.max(0, Math.min(c1[i] - lo1, hi1 - c1[i]));
+        const d2 = Math.max(0, Math.min(c2[i] - lo2, hi2 - c2[i]));
+        sum += 1 / Math.max(Math.min(d1, d2), D0);
+      }
+      return sum;
+    };
+    let wSum = 0;
+    for (const p of priors) wSum += p.w;
+    const prior = (t) => {
+      if (!wSum) return 0;
+      let s = 0;
+      for (const p of priors) s += p.w * (1 + Math.cos(4 * (t - p.yaw))) / 2;
+      return s / wSum;
+    };
+    const lambda = n < 40 ? 0.6 : n < 150 ? 0.3 : 0.12;
+
+    const coarse = [];
+    for (let d = 0; d < 90; d++) coarse.push(closeness(d * RAD));
+    const sMax = Math.max(...coarse), sMin = Math.min(...coarse), span = sMax - sMin || 1;
+    const total = (t, s) => (s - sMin) / span + lambda * prior(t);
+    let bestD = 0;
+    for (let d = 1; d < 90; d++) if (total(d * RAD, coarse[d]) > total(bestD * RAD, coarse[bestD])) bestD = d;
+    let best = bestD * RAD;
+    // Tinh chỉnh dưới 1°: gán điểm vào cạnh gần nhất, fit đường thẳng (TLS) cho từng cạnh,
+    // rồi lấy trung bình hướng các cạnh (trong không gian 4θ để cạnh dọc/ngang cùng một nghĩa).
+    for (let iter = 0; iter < 3; iter++) {
+      const c = Math.cos(best), s = Math.sin(best);
+      for (let i = 0; i < n; i++) { c1[i] = X[i] * c + Y[i] * s; c2[i] = -X[i] * s + Y[i] * c; }
+      const s1 = Array.from(c1).sort((u, v) => u - v), s2 = Array.from(c2).sort((u, v) => u - v);
+      const k0 = Math.floor(0.01 * (n - 1)), k1 = Math.ceil(0.99 * (n - 1));
+      const bounds = [s1[k0], s1[k1], s2[k0], s2[k1]];
+      const groups = [[], [], [], []];
+      for (let i = 0; i < n; i++) {
+        const ds = [c1[i] - bounds[0], bounds[1] - c1[i], c2[i] - bounds[2], bounds[3] - c2[i]].map(Math.abs);
+        const k = ds.indexOf(Math.min(...ds));
+        if (ds[k] < 0.25) groups[k].push(i);
+      }
+      let vc = 0, vs = 0;
+      groups.forEach((g, k) => {
+        if (g.length < 8) return;
+        let gx = 0, gy = 0;
+        for (const i of g) { gx += X[i]; gy += Y[i]; }
+        gx /= g.length; gy /= g.length;
+        let sxx = 0, syy = 0, sxy = 0;
+        for (const i of g) { const dx = X[i] - gx, dy = Y[i] - gy; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+        const dir = 0.5 * Math.atan2(2 * sxy, sxx - syy); // hướng cạnh
+        const spread = Math.sqrt((sxx + syy) / g.length);
+        if (spread < 0.3) return; // cạnh quá ngắn, hướng không tin được
+        const th = k < 2 ? dir - Math.PI / 2 : dir; // cạnh vuông góc e1 có hướng e2 = θ + 90°
+        vc += g.length * Math.cos(4 * th);
+        vs += g.length * Math.sin(4 * th);
+      });
+      if (!vc && !vs) break;
+      let th = Math.atan2(vs, vc) / 4;
+      while (angleDiff(th, best) > Math.PI / 4 + 1e-9) th += Math.PI / 2; // về cùng nhánh với best
+      th = ((th % (Math.PI / 2)) + Math.PI / 2) % (Math.PI / 2);
+      if (Math.abs(Math.sin(2 * (th - best))) > Math.sin(2 * 3 * RAD)) break; // lệch > 3° => giữ kết quả thô
+      const moved = Math.abs(Math.sin(2 * (th - best)));
+      best = th;
+      if (moved < 1e-4) break;
     }
-    return 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    // Độ rõ: đỉnh tốt nhất trội hơn mọi hướng cách nó > 10° bao nhiêu (theo closeness thuần)
+    let rival = 0;
+    for (let d = 0; d < 90; d++) {
+      const gap = Math.abs(((d - bestD) % 90 + 135) % 90 - 45);
+      if (gap > 10) rival = Math.max(rival, (coarse[d] - sMin) / span);
+    }
+    return { yaw: best, conf: 1 - rival };
+  }
+
+  // Hướng các box xung quanh làm "gợi ý" cho fitRectYaw (chỉ box dài, trong 30 m)
+  function yawPriors(p, others) {
+    const out = [];
+    for (const q of others) {
+      const l = Math.abs(q[6]), w = Math.abs(q[7]);
+      if (Math.max(l, w) < 1.4 * Math.min(l, w)) continue;
+      const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+      if (d < 0.5 || d > 30) continue;
+      out.push({ yaw: q[5], w: 1 / (1 + d / 10) });
+    }
+    return out;
   }
 
   // Trong 4 hướng yaw + k·90°, chọn hướng gần góc hiện tại nhất (giữ L theo đầu xe)
@@ -1136,12 +1277,26 @@
   // Smart Snap: hút box theo cụm điểm LiDAR
   // =========================================================================
 
-  // Trả về { points, n } hoặc { error }.
+  // Điểm của object trong box (đã bỏ lớp mặt đất) + mặt đất cục bộ
+  function objectPoints(p, positions, margin) {
+    const plane = estimateGroundPlane(p, positions);
+    let pts = pointsInBox(p, positions, margin);
+    if (plane) {
+      pts = pts.filter((q) => q[2] - planeZ(plane, q[0], q[1]) > 0.15);
+    } else if (pts.length) {
+      const floor = percentile(pts.map((q) => q[2]), 0.02) + 0.15;
+      pts = pts.filter((q) => q[2] > floor);
+    }
+    return { pts, plane };
+  }
+
+  // Trả về { points, n, conf } hoặc { error }.
+  // priors: hướng các box xung quanh (xem yawPriors), giúp khi cloud thưa / chỉ thấy 1 mặt.
   // Lặp: mỗi lượt cắt lại cụm điểm theo box của lượt trước, để hướng không bị lệch do box ban đầu xoay sai.
-  function computeSmartSnap(p, positions, fitSize) {
-    let result = smartSnapOnce(p, positions, fitSize, p[5]);
+  function computeSmartSnap(p, positions, fitSize, priors = []) {
+    let result = smartSnapOnce(p, positions, fitSize, p[5], priors);
     for (let iter = 0; iter < 4 && !result.error; iter++) {
-      const next = smartSnapOnce(result.points, positions, fitSize, p[5]);
+      const next = smartSnapOnce(result.points, positions, fitSize, p[5], priors);
       if (next.error) break;
       const converged = angleDiff(next.points[5], result.points[5]) < 0.2 * RAD &&
         Math.hypot(next.points[0] - result.points[0], next.points[1] - result.points[1]) < 0.01;
@@ -1151,19 +1306,12 @@
     return result;
   }
 
-  function smartSnapOnce(p, positions, fitSize, refYaw) {
-    const plane = estimateGroundPlane(p, positions);
-    let pts = pointsInBox(p, positions, 0.3);
-    // Bỏ điểm mặt đường
-    if (plane) {
-      pts = pts.filter((q) => q[2] - planeZ(plane, q[0], q[1]) > 0.15);
-    } else if (pts.length) {
-      const floor = percentile(pts.map((q) => q[2]), 0.02) + 0.15;
-      pts = pts.filter((q) => q[2] > floor);
-    }
+  function smartSnapOnce(p, positions, fitSize, refYaw, priors) {
+    const { pts, plane } = objectPoints(p, positions, 0.3);
     if (pts.length < 10) return { error: `Chỉ có ${pts.length} điểm trong vùng box (cần ≥ 10).` };
 
-    const yaw = nearestQuarterYaw(pcaYaw(pts), refYaw);
+    const fit = fitRectYaw(pts, priors);
+    const yaw = nearestQuarterYaw(fit.yaw, refYaw);
     const c = Math.cos(yaw), s = Math.sin(yaw);
     let mx = 0, my = 0;
     for (const q of pts) { mx += q[0]; my += q[1]; }
@@ -1200,7 +1348,7 @@
     const bottom = planeZ(ground, out[0], out[1]);
     out[8] = fitSize ? Math.max(0.3, zMax - bottom) : Math.abs(p[8]);
     out[2] = bottom + out[8] / 2;
-    return { points: fitToGround(out, ground, 'snap'), n: pts.length };
+    return { points: fitToGround(out, ground, 'snap'), n: pts.length, conf: fit.conf };
   }
 
   async function smartSnap(ids) {
@@ -1213,13 +1361,16 @@
 
     const fitSize = isChecked('cqt-snap-fit-size');
     const batch = createBatch(fitSize ? 'Smart Snap (fit size)' : 'Smart Snap');
-    const errors = [];
+    const errors = [], unsure = [];
     let lastN = 0;
+    const states = (await getStates(frame)).filter((s) => isCuboid(s) && !s.outside);
     for (const id of list) {
-      const s = await getState(id, frame);
-      if (!isCuboid(s) || s.outside) continue;
-      const r = computeSmartSnap([...s.points], positions, fitSize);
+      const s = states.find((x) => x.clientID === id);
+      if (!s) continue;
+      const priors = yawPriors(s.points, states.filter((x) => x.clientID !== id).map((x) => x.points));
+      const r = computeSmartSnap([...s.points], positions, fitSize, priors);
       if (r.error) { errors.push(`#${id}: ${r.error}`); continue; }
+      if (r.conf < 0.25) unsure.push(id);
       lastN = r.n;
       await batch.edit(s, frame, (st) => { st.points = r.points; });
     }
@@ -1228,12 +1379,13 @@
     setStatus(
       `🧲 Smart Snap ${res.changed} object` + (list.length === 1 ? ` (${lastN} điểm)` : '') +
       (fitSize ? ', đã fit cả size' : ', giữ nguyên LWH') + '.' +
+      (unsure.length ? ` ⚠️ Hướng chưa chắc (cloud thưa/1 mặt, đã dựa thêm vào box xung quanh): #${unsure.join(', #')}.` : '') +
       (errors.length ? ` Lỗi: ${errors.join(' ')}` : '') + editSuffix(res),
-      errors.length ? 'warn' : 'success'
+      errors.length || unsure.length ? 'warn' : 'success'
     );
   }
 
-  // Chỉ xoay yaw theo trục chính của cụm điểm
+  // Chỉ xoay yaw theo cạnh của cụm điểm (L-shape fitting), giữ nguyên vị trí và LWH
   async function alignYawToCloud() {
     const id = requireTarget();
     if (id === null) return;
@@ -1242,12 +1394,12 @@
     if (!s) return;
     const positions = getPointCloudPositions();
     if (!positions) return fail('Không đọc được point cloud.');
-    const pts = pointsInBox(s.points, positions, 0.15);
+    const { pts } = objectPoints(s.points, positions, 0.15);
     if (pts.length < 15) return fail(`Chỉ có ${pts.length} điểm trong box, không đủ để nắn góc.`);
 
-    // Chỉ lật trong mod π (giữ đầu xe), không đổi trục L/W
-    let yaw = pcaYaw(pts);
-    if (angleDiff(yaw, s.points[5]) > Math.PI / 2) yaw = wrapPi(yaw + Math.PI);
+    const others = (await getStates(frame)).filter((x) => x.clientID !== id && isCuboid(x) && !x.outside).map((x) => x.points);
+    const fit = fitRectYaw(pts, yawPriors(s.points, others));
+    const yaw = nearestQuarterYaw(fit.yaw, s.points[5]); // hướng gần góc hiện tại nhất => giữ đầu xe
     const batch = createBatch('Nắn theo cloud');
     await batch.edit(s, frame, (st) => {
       const p = [...st.points];
@@ -1256,7 +1408,8 @@
     });
     const res = await batch.finish();
     await inspectHeading(id, frame);
-    setStatus(`☁️ Đã nắn #${id} theo trục cụm điểm (${(yaw * DEG).toFixed(1)}°, ${pts.length} điểm).` + editSuffix(res), 'success');
+    setStatus(`☁️ Đã nắn #${id} theo cạnh cụm điểm (${(yaw * DEG).toFixed(1)}°, ${pts.length} điểm).` +
+      (fit.conf < 0.25 ? ' ⚠️ Hướng chưa chắc, kiểm tra lại.' : '') + editSuffix(res), fit.conf < 0.25 ? 'warn' : 'success');
   }
 
   // =========================================================================
@@ -2146,6 +2299,7 @@
     overlap: 'Chồng lấn',
     dist: 'Quá xa',
     limits: 'Ngoài limits',
+    ground: 'Chưa chạm đất',
   };
 
   let lastQA = null; // { rows, data, opts, range }
@@ -2174,6 +2328,9 @@
     read('cqt-qa-check-dist', 'dist');
     read('cqt-qa-dist-threshold', 'distThresh', true);
     read('cqt-qa-check-limits', 'limits');
+    read('cqt-qa-check-ground', 'ground');
+    read('cqt-qa-ground-tol', 'groundTol', true);
+    read('cqt-qa-ground-all', 'groundAll');
     read('cqt-qa-whole-job', 'wholeJob');
     lsSet(LS.qa, o);
     return o;
@@ -2199,6 +2356,9 @@
     set('cqt-qa-check-dist', o.dist);
     set('cqt-qa-dist-threshold', o.distThresh);
     set('cqt-qa-check-limits', o.limits);
+    set('cqt-qa-check-ground', o.ground);
+    set('cqt-qa-ground-tol', o.groundTol);
+    set('cqt-qa-ground-all', o.groundAll);
     set('cqt-qa-whole-job', o.wholeJob);
   }
 
@@ -2381,6 +2541,59 @@
     for (const r of rows) r.itemId = names.get(r.frame) || '';
   }
 
+  // Point cloud chỉ có cho frame đang hiển thị => chuyển frame rồi chờ CVAT nạp cloud mới
+  async function cloudAtFrame(f, prev) {
+    if (getFrame() === f && prev) return prev;
+    if (!(await goToFrame(f))) return null;
+    for (let t = 0; t < 50; t++) {
+      const pos = getPointCloudPositions();
+      if (pos && pos !== prev) return pos;
+      await sleep(100);
+    }
+    return null;
+  }
+
+  // Chưa chạm đất: so góc thấp nhất của box với mặt đất cục bộ đo từ cloud (estimateGroundPlane).
+  // Mỗi dòng lưu kèm plane để auto-fix hạ/nâng đúng frame đó.
+  async function scanGroundRows(data, opts) {
+    const byFrame = new Map(); // frame -> [{ rec, x }]
+    for (const rec of data.tracks.values()) {
+      for (const x of rec.frames) {
+        if (!opts.groundAll && !x.keyframe) continue;
+        if (!byFrame.has(x.frame)) byFrame.set(x.frame, []);
+        byFrame.get(x.frame).push({ rec, x });
+      }
+    }
+    const original = getFrame();
+    // Frame đang mở trước (khỏi chờ nạp), còn lại theo thứ tự
+    const frames = [...byFrame.keys()].sort((a, b) => (a === original ? -1 : b === original ? 1 : a - b));
+    const rows = [];
+    let prev = frames[0] === original ? getPointCloudPositions() : null;
+    let noCloud = 0, noGround = 0, checked = 0;
+    for (let i = 0; i < frames.length; i++) {
+      const f = frames[i];
+      setStatus(`⏳ QA mặt đất: frame ${f} (${i + 1}/${frames.length})...`);
+      const pos = await cloudAtFrame(f, prev);
+      if (!pos) { noCloud++; continue; }
+      prev = pos;
+      for (const { rec, x } of byFrame.get(f)) {
+        const plane = estimateGroundPlane(x.points, pos);
+        if (!plane) { noGround++; continue; }
+        checked++;
+        const gap = groundGap(x.points, plane);
+        if (Math.abs(gap) <= opts.groundTol) continue;
+        rows.push({
+          frame: f, itemId: '', trackId: rec.id, cls: rec.label, type: QA_TYPES.ground,
+          desc: gap > 0 ? `Lơ lửng ${gap.toFixed(3)} m trên mặt đất` : `Lún ${(-gap).toFixed(3)} m xuống mặt đất`,
+          value: gap.toFixed(3), threshold: `|lệch| ≤ ${opts.groundTol} m`, related: '',
+          plane, keyframe: x.keyframe,
+        });
+      }
+    }
+    if (Number.isInteger(original) && getFrame() !== original) await goToFrame(original);
+    return { rows, stats: { checked, noCloud, noGround, frames: frames.length } };
+  }
+
   async function scanQA() {
     const opts = readQAOptionsFromUI();
     const range = qaRange(opts);
@@ -2389,12 +2602,20 @@
     const data = await scanJobData(range.from, range.to);
     if (!data.tracks.size) return fail('Không có cuboid nào trong dải.');
     const rows = runQAChecks(data, opts);
+    let groundNote = '';
+    if (opts.ground) {
+      const g = await scanGroundRows(data, opts);
+      rows.push(...g.rows);
+      groundNote = ` Mặt đất: đo ${g.stats.checked} box / ${g.stats.frames} frame` +
+        (g.stats.noCloud ? `, ${g.stats.noCloud} frame không đọc được cloud` : '') +
+        (g.stats.noGround ? `, ${g.stats.noGround} box thiếu điểm đất` : '') + '.';
+    }
     await fillItemIds(rows);
     lastQA = { rows, data, opts, range };
     renderQAResult();
     const tracks = new Set(rows.map((r) => r.trackId)).size;
     setStatus(
-      `🔎 QA ${range.from}–${range.to}: ${data.tracks.size} object, ${rows.length} lỗi ở ${tracks} object.`,
+      `🔎 QA ${range.from}–${range.to}: ${data.tracks.size} object, ${rows.length} lỗi ở ${tracks} object.` + groundNote,
       rows.length ? 'warn' : 'success'
     );
     return lastQA;
@@ -2826,7 +3047,52 @@
     }));
   }
 
-  // types: tập loại cần đề xuất ('size', 'yaw', 'far', 'overlap')
+  // Chưa chạm đất: hạ/nâng keyframe về mặt đất đã đo (giữ nghiêng). Frame nội suy thì báo sửa tay
+  // (sửa trực tiếp sẽ tạo keyframe mới): sửa keyframe kề rồi quét lại.
+  function planGroundFix(rows) {
+    const ops = [];
+    const byTrack = new Map();
+    for (const r of rows) {
+      if (r.type !== QA_TYPES.ground) continue;
+      if (!byTrack.has(r.trackId)) byTrack.set(r.trackId, []);
+      byTrack.get(r.trackId).push(r);
+    }
+    for (const [id, list] of byTrack) {
+      const keys = list.filter((r) => r.keyframe);
+      const inter = list.filter((r) => !r.keyframe);
+      const cls = list[0].cls;
+      if (keys.length) {
+        const gaps = keys.map((r) => +r.value);
+        ops.push({
+          type: 'ground', trackId: id, auto: true, checked: true,
+          title: `#${id} [${cls}] · Đặt chạm đất ${keys.length} keyframe`,
+          detail: `Lệch ${fmtSigned(Math.min(...gaps), 3)} → ${fmtSigned(Math.max(...gaps), 3)} m, giữ nghiêng: ${framesText(keys.map((r) => r.frame))}`,
+          apply: async (batch) => {
+            for (const r of keys) {
+              const s = await getState(id, r.frame);
+              if (!isCuboid(s) || s.outside) continue;
+              await batch.edit(s, r.frame, (st) => {
+                const after = fitToGround(st.points, r.plane, 'snap');
+                if (Math.abs(after[2] - st.points[2]) < 1e-4) return false;
+                st.points = after;
+                return true;
+              });
+            }
+          },
+        });
+      }
+      if (inter.length) {
+        ops.push({
+          type: 'ground', trackId: id, auto: false, frame: inter[0].frame,
+          title: `#${id} [${cls}] · ${inter.length} frame nội suy chưa chạm đất`,
+          detail: `Sửa keyframe gần đó hoặc thêm keyframe: ${framesText(inter.map((r) => r.frame))}`,
+        });
+      }
+    }
+    return ops;
+  }
+
+  // types: tập loại cần đề xuất ('size', 'yaw', 'ground', 'far', 'overlap')
   function planFixes(qa, types) {
     const { rows, data, opts } = qa;
     const flagged = (type) => new Set(rows.filter((r) => r.type === type).map((r) => r.trackId));
@@ -2861,6 +3127,7 @@
         else manualNote('yaw', id, 'Đổi hướng đột ngột');
       }
     }
+    if (types.has('ground')) ops.push(...planGroundFix(rows));
     if (types.has('far')) {
       for (const id of flagged(QA_TYPES.dist)) {
         const op = planFarFix(data.tracks.get(id), opts);
@@ -2874,7 +3141,7 @@
   async function previewAutoFix() {
     const qa = lastQA || await scanQA();
     if (!qa) return;
-    const ops = planFixes(qa, new Set(['missingTrack', 'duplicateTrack', 'unknownClass', 'size', 'yaw', 'far', 'overlap']));
+    const ops = planFixes(qa, new Set(['missingTrack', 'duplicateTrack', 'unknownClass', 'size', 'yaw', 'ground', 'far', 'overlap']));
     if (!ops.length) return setStatus('✅ Không có lỗi nào cần sửa.', 'success');
     openFixPreview('Xem trước auto-fix QA', ops);
   }
@@ -2990,8 +3257,9 @@
 
   async function applyFixes(title, ops) {
     const batch = createBatch(title);
-    // Đổi label trước (có thể đặt lại thuộc tính), rồi track_id, size, yaw; outside làm cuối vì ẩn frame
-    const order = { unknownClass: 0, missingTrack: 1, size: 2, yaw: 3, duplicateTrack: 4, far: 5 };
+    // Đổi label trước (có thể đặt lại thuộc tính), rồi track_id, size, yaw, chạm đất (sau size/yaw vì 2 cái đó đổi góc đáy);
+    // outside làm cuối vì ẩn frame
+    const order = { unknownClass: 0, missingTrack: 1, size: 2, yaw: 3, ground: 4, duplicateTrack: 5, far: 6 };
     const sorted = [...ops].sort((a, b) => order[a.type] - order[b.type]);
     for (let i = 0; i < sorted.length; i++) {
       setStatus(`⏳ Đang sửa ${i + 1}/${sorted.length}: ${sorted[i].title}`);
@@ -3807,6 +4075,8 @@
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-overlap" /> Chồng lấn (ped–ped cho IoU ≤ <input type="number" step="0.05" id="cqt-qa-pedped-iou" class="cqt-input cqt-mini" />)</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-dist" /> Quá xa &gt; <input type="number" id="cqt-qa-dist-threshold" class="cqt-input cqt-mini" /> m</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-limits" /> Ngoài limits LWH của class</label>
+            <label class="cqt-check" title="Tool tự chuyển qua từng frame để đọc point cloud, nên chậm hơn các mục khác"><input type="checkbox" id="cqt-qa-check-ground" /> Chưa chạm đất, đáy lệch &gt; <input type="number" step="0.01" id="cqt-qa-ground-tol" class="cqt-input cqt-mini" /> m (chậm)</label>
+            <label class="cqt-check" style="margin-left:18px"><input type="checkbox" id="cqt-qa-ground-all" /> Xét cả frame nội suy (bỏ chọn = chỉ keyframe)</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-whole-job" /> Quét toàn job (bỏ chọn = dải Start–End)</label>
           </div>
           <div class="cqt-row">
