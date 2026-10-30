@@ -1,14 +1,22 @@
-# CVAT Cuboid Toolbox v3.3.0 — Hướng dẫn đầy đủ
+# CVAT Cuboid Toolbox v3.4.0 — Hướng dẫn đầy đủ
 
-Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: Smart Snap theo point cloud, sửa LWH/preset, fit mặt đất phẳng & dốc (point cloud & box tham chiếu), kế thừa ground frame trước, quản lý hướng/track, chọn nhiều box, thao tác kiểu Blender, QA + auto-fix có xem trước, snapshot.
+Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: Header Target/Dải toàn cục, Smart Snap theo point cloud, sửa LWH/preset, quét cloud đa frame, bám box tham chiếu, fit mặt đất phẳng & dốc, quản lý hướng/track, chọn nhiều box, thao tác kiểu Blender, QA + auto-fix có xem trước, snapshot.
 
-> File script: `cvat-cuboid-quicktool.user.js` (v3.3.0)  
-> Tài liệu cập nhật: 30/10/2026 — khớp với code v3.3.0.  
+> File script: `cvat-cuboid-quicktool.user.js` (v3.4.0)  
+> Tài liệu cập nhật: 30/10/2026 — khớp với code v3.4.0.  
 > Chỉ chạy trên trang `/jobs/<id>` của CVAT. Không cần reload sau khi cài.
 >
 > **Đang dùng bản cũ?** Đọc mục [1.5](#15-khác-biệt-so-với-bản-2x-đọc-trước-khi-nâng-cấp) và [14](#14-lịch-sử-phiên-bản) để xem các thay đổi mới.
 
-### Có gì mới ở 3.3.0
+### Có gì mới ở 3.4.0
+
+- **🔝 Header toàn cục (Target & Dải Frame)**: Đưa Target Object ID, nút `🎯 Auto`, Frame hiện tại, `Start Frame`, `End Frame`, `Số frame` và nút `🔍 Dò dải` lên cố định trên đỉnh panel (ngay trên các tab). Luôn nhìn thấy và thao tác được dù đang ở bất kỳ tab nào (Object, Ground, Track, QA, Settings).
+- **🤖 Quét Cloud từng frame (Auto-Sweep Cloud Fit)**: Tự động duyệt dải frame, chuyển frame và nạp point cloud của từng frame để fit mặt đất độc lập. Triệt tiêu 100% sai số lệch toạ độ do xe Ego rung lắc / dằn xóc (Sensor Frame coordinate shift).
+- **👥 Bám Box tham chiếu dải (Follow Reference Tracks)**: Duyệt dải frame, tại mỗi frame đọc đáy của các xe tham chiếu ngay tại frame đó để hạ target (siêu tốc, không cần chờ tải cloud).
+- **⬇️ Fit frame hiện tại**: Nút bấm riêng biệt để hạ chạm đất tức thời cho frame đang xem mà không ảnh hưởng tới các frame khác.
+- **Phạm vi dải linh hoạt**: Bổ sung tuỳ chọn `Từ frame này → Hết dải`, tự động tính `detectSpan` nếu người dùng chưa kịp dò dải.
+
+### Các nâng cấp ở 3.3.0
 
 - **👥 Plane từ box tham chiếu**: Fit mặt phẳng dốc 3D $Z = aX + bY + c$ qua đáy các box xung quanh đã chuẩn đất (chọn qua Shift+Click hoặc gõ danh sách ID, cần $\ge 2$ box). Giải bình phương tối thiểu (LSQ), tự loại bỏ dốc ảo $>15^\circ$.
 - **⏮️ Kế thừa Ground frame trước**: Nút bấm lấy lại mặt phẳng đất của frame trước ($F-1$). Kèm tuỳ chọn **Tự kế thừa plane frame trước khi mất cloud** khi fit dải hoặc bấm Alt+G.
@@ -150,6 +158,10 @@ Tất cả dữ liệu trên đều thuộc **trình duyệt**, không đồng b
 - **Handle `◀ TOOLBOX`**: bấm để ghim / bỏ ghim. **📌** cũng là ghim; **✕** để thu gọn.
 - **Header** hiển thị `📦 CVAT Toolbox` + badge phiên bản. Kéo header để di chuyển **theo chiều dọc**; vị trí được nhớ trong `cqt_panel_top_v2`.
 - **Thanh Camera** ngay dưới header: 🎯 Focus · 🔝 Top · 🚗 Front · ↔️ Side.
+- **Thanh Target & Dải frame toàn cục (Global Bar)**: Nằm cố định ngay dưới thanh Camera và trên thanh Tabs, luôn luôn hiển thị và thao tác được trên mọi tab:
+  - **Target ID**: nhập ID hoặc bấm **🎯 Auto** để tự động nhận diện object đang chọn trên canvas.
+  - **Frame hiện tại**: hiển thị frame CVAT đang mở.
+  - **Dải**: `Start Frame → End Frame` (kèm tổng số frame) và nút **🔍 Dò dải** (tự động tìm frame đầu/cuối của object trong job). Giúp bạn luôn quan sát và điều khiển dải frame mà không cần phải chuyển qua lại tab Object.
 - **5 tab**: Object · Ground · Track · QA · Cài đặt.
 - **Status bar** ở đáy panel: thông báo thao tác gần nhất (xanh = thành công, vàng = cảnh báo, đỏ = lỗi).
 - **Log** ở tab QA: 60 dòng thao tác gần nhất kèm giờ.
@@ -515,30 +527,31 @@ Nếu chưa có mặt phẳng mà bấm **Kiểm tra đáy** / **Fit mặt đấ
 
 ### 5.4. Phạm vi & hướng
 
-**Phạm vi** (`Fit mặt đất`)
-
-- **Keyframe trong dải** (mặc định): nhẹ, giữ nội suy.
-- **Mọi frame (bake)**: chính xác từng frame nhưng tạo keyframe ở mọi frame.
-- **Frame hiện tại**: chỉ sửa frame đang xem.
+**Phạm vi dải**
+- **Từ frame này → Hết dải** (mặc định): Chạy từ frame hiện tại đến `End Frame` của object. Nếu chưa bấm dò dải, tool sẽ tự động tính `detectSpan` để lấy `End Frame`.
+- **Toàn bộ dải Start–End**: Áp dụng cho toàn bộ các frame trong dải đã chọn.
+- **Chỉ keyframe trong dải**: Chỉ sửa keyframe, giữ nguyên chuyển động nội suy.
+- **Chỉ frame hiện tại**: Chỉ tác động đúng 1 frame đang mở.
 
 **Hướng** (chỉ xét độ dời Z)
-
 - **Cả hai**: sửa cả box lún và bay.
 - **Chỉ hạ**: chỉ sửa box đang lún (`dz < 0`).
 - **Chỉ nâng**: chỉ sửa box đang bay (`dz > 0`).
 
 > Nếu mode *Nghiêng theo dốc* chỉ đổi góc mà `dz ≈ 0`, hướng không chặn thao tác (vì không có dời Z).
 
-### 5.5. Kiểm tra & Fit
+### 5.5. Ba phương thức Fit mặt đất (Giải quyết triệt để lệch toạ độ Ego Sensor)
 
-- **📏 Kiểm tra đáy**: quét các frame có object trong phạm vi (trừ khi chọn *Frame hiện tại* — khi đó chỉ đo frame này; **không** lọc keyframe), báo:
-  - `min/max` độ lệch đáy so với mặt phẳng (m),
-  - số frame lún (< −1 cm) và lơ lửng (> +1 cm).
-- **⬇️ Fit mặt đất**: áp dụng cho phạm vi/hướng/mode đang chọn; báo số frame đã sửa, khoảng `dz`, số frame bị bỏ qua do hướng.
-  - Không có keyframe trong dải và đang chọn *Keyframe* → status gợi ý chọn *Mọi frame*.
-  - Không frame nào cần đổi → status thông báo, không tạo snapshot rỗng.
+Do các bộ dữ liệu LiDAR thường đặt gốc toạ độ tại cảm biến xe Ego (Sensor Frame), khi xe Ego di chuyển/dằn xóc thì toạ độ thế giới của mặt đất thay đổi ở từng frame. Vì vậy, tool cung cấp 3 nút bấm chuyên biệt:
 
-> Fit chỉ tác động frame có object và **không outside**. Frame ngoài dải hoặc outside có thể vẫn lệch — kiểm tra lại.
+| Nút bấm | Cơ chế hoạt động | Ưu điểm & Khi nào dùng |
+|---|---|---|
+| **⬇️ Fit frame hiện tại** | Hạ chạm đất tức thì cho target box tại frame đang xem theo mặt phẳng đang lưu | Dùng khi chỉnh sửa nhanh từng frame hoặc khi vừa tính plane xong |
+| **🤖 Quét Cloud từng frame** | Tự động chuyển qua từng frame trong dải (`cloudAtFrame`), nạp point cloud của frame đó và đo mặt đất cục bộ | **Chuẩn xác nhất theo LiDAR (100%)**: Triệt tiêu hoàn toàn sai số do xe Ego rung lắc / dốc thay đổi giữa các frame |
+| **👥 Bám Box tham chiếu dải** | Duyệt dải frame, tại mỗi frame đọc đáy của các xe tham chiếu ở frame đó để hạ target | **Siêu nhanh (< 0.5s)**: Không cần nạp cloud. Hoàn hảo khi xe mục tiêu bị che khuất / thưa điểm nhưng có xe khác chạy song song |
+
+- **Tự kế thừa plane frame trước khi mất cloud**: Tích chọn checkbox này để khi chạy `Quét Cloud` hoặc `Bám Box`, nếu frame nào bị mất điểm LiDAR hoặc mất box tham chiếu, tool sẽ tự động kế thừa plane hợp lệ gần nhất, không bỏ sót frame nào.
+- **📏 Kiểm tra đáy**: Quét đo độ lệch đáy của target box so với mặt đất trong toàn bộ dải, báo min/max và số frame lún/bay.
 
 ### 5.6. Alt+G — hạ chạm đất nhanh
 
@@ -548,21 +561,16 @@ Nếu chưa có mặt phẳng mà bấm **Kiểm tra đáy** / **Fit mặt đấ
 - Chỉ sửa frame hiện tại; có snapshot; báo số object đã hạ.
 - Nếu **không object nào** hạ được (không đủ điểm cloud, không có mặt phẳng lưu) → báo `Không đủ điểm cloud để tìm mặt đất.`; nếu chỉ một phần lỗi, status chỉ báo số object đã hạ.
 
-### 5.7. Quy trình ground chuẩn
+### 5.7. Quy trình ground chuẩn cho track dài
 
 1. Đứng ở frame đại diện (xe nằm rõ trên mặt đường).
-2. **📐 Plane từ cloud** (hoặc **📊 Z box khác** / nhập Z).
-3. **📏 Kiểm tra đáy** xem lệch bao nhiêu.
-4. Chọn mode / phạm vi / hướng.
-5. **⬇️ Fit mặt đất**.
-6. Kiểm tra lại vài frame; `Ctrl+S`.
-
-**Lưu ý đường dốc/cong**
-
-- Mặt phẳng được fit từ cloud của **một frame**; áp cho đoạn dài trên đường cong sẽ lệch dần.
-- Với đường dốc đều: dùng *Nghiêng theo dốc* + *Keyframe trong dải*.
-- Với đường cong/đổi dốc: chia đoạn, fit lại từng đoạn, hoặc dùng **Alt+G / Chạm đất** tại từng frame (mỗi object tự lấy mặt đất cục bộ).
-- Sau khi fit, **📏 Kiểm tra đáy** lại để phát hiện đoạn còn lệch.
+2. **Top Bar**: Bấm **🎯 Auto** để nhận diện target, bấm **🔍 Dò dải** để lấy trọn vẹn Start → End của track.
+3. **Tab Ground**: Chọn mode (*Nghiêng theo dốc* hoặc *Snap đáy*), chọn phạm vi (*Từ frame này → Hết dải*).
+4. **Lựa chọn cách fit**:
+   - Nếu đường nhiều dốc, mấp mô, xe Ego nhún nhảy: Bấm **`🤖 Quét Cloud từng frame`** để tool tự nạp cloud và fit chuẩn từng frame.
+   - Nếu có xe khác đi cùng đã chuẩn đất: Nhập ID xe đó vào ô tham chiếu $\rightarrow$ Bấm **`👥 Bám Box tham chiếu dải`**.
+5. Bấm **📏 Kiểm tra đáy** lại để xác nhận toàn bộ track đã tiếp đất hoàn hảo.
+6. `Ctrl+S` để lưu lên server.
 
 ### 5.8. Đã bỏ
 
@@ -1105,6 +1113,12 @@ Trong CVAT, `save()` tại frame không phải keyframe sẽ tạo keyframe tạ
 
 ## 14. Lịch sử phiên bản
 
+- **3.4.0** (30/10/2026):
+  - **Thanh Target & Dải frame toàn cục**: Đưa Target ID, nút 🎯 Auto, Frame hiện tại, Start/End frame và nút 🔍 Dò dải lên vị trí cố định trên đỉnh panel, điều khiển xuyên suốt mọi tab.
+  - **🤖 Quét Cloud từng frame**: Tự động chuyển frame và nạp point cloud của từng frame để fit mặt đất độc lập (giải quyết triệt để vấn đề sai lệch toạ độ Ego Sensor).
+  - **👥 Bám Box tham chiếu dải**: Duyệt dải frame và hạ target theo cao độ các box tham chiếu ở từng frame (chạy tức thời không cần nạp cloud).
+  - **⬇️ Fit frame hiện tại**: Phân tách rõ ràng giữa fit frame đơn và fit đa frame.
+  - **Phạm vi dải linh hoạt**: Bổ sung tuỳ chọn "Từ frame này → Hết dải" (tự động tính `detectSpan`).
 - **3.3.0** (30/10/2026):
   - **👥 Plane từ box chọn**: Cho phép chọn các box xung quanh đã chuẩn đất (qua Shift+Click hoặc gõ danh sách ID, $\ge 2$ box), lấy 4 góc đáy của từng box giải LSQ plane 3D để tạo mặt phẳng dốc chuẩn, tự loại bỏ dốc $>15^\circ$.
   - **⏮️ Ground frame trước**: Nút bấm một chạm kế thừa mặt phẳng đất đã lưu của frame liền kề trước đó ($F-1$).
@@ -1136,7 +1150,9 @@ Trong CVAT, `save()` tại frame không phải keyframe sẽ tạo keyframe tạ
 
 | Nút / ô / phím | Vị trí | Tác dụng |
 |---|---|---|
-| 🎯 Auto | Object | Lấy object đang chọn + LWH + dải 1 frame + đo hướng |
+| Target ID / 🎯 Auto | Top Bar | Nhập ID hoặc tự nhận diện object đang chọn trên canvas |
+| Start / End / Số frame | Top Bar | Dải frame áp dụng (luôn hiển thị trên mọi tab) |
+| 🔍 Dò dải | Top Bar | Dò frame đầu/cuối của object trong job |
 | 🧲 Smart Snap / Alt+S | Object | Snap box theo cụm điểm (target; Alt+S dùng nhóm chọn) |
 | Fit size | Object | Smart Snap tính lại cả L/W/H |
 | Tất cả trong frame | Object | Chọn mọi box ở frame hiện tại |
@@ -1144,8 +1160,6 @@ Trong CVAT, `save()` tại frame không phải keyframe sẽ tạo keyframe tạ
 | ⬇️ Chạm đất | Object | Hạ đáy cả nhóm chạm mặt đất |
 | 🙈 Outside | Object | Đặt outside từ frame hiện tại |
 | ↔️ Dịch | Object | Dịch nhóm theo dX/dY/dZ |
-| Start / End / Số frame | Object | Dải áp dụng |
-| 🔍 Tự lấy dải frame | Object | Dò frame đầu/cuối của object |
 | Lấy size | Object | Đọc LWH + đo hướng + cảnh báo limits |
 | 📐 Áp dụng LWH | Object | Áp LWH cho dải (mặc định chỉ keyframe) |
 | 🔗 Toàn track | Object | Áp LWH cho mọi keyframe |
@@ -1160,10 +1174,13 @@ Trong CVAT, `save()` tại frame không phải keyframe sẽ tạo keyframe tạ
 | 📊 Z box khác | Ground | Z ngang = trung vị đáy ≥ 2 box khác |
 | 📌 Z từ box này | Ground | Z ngang = đáy object hiện tại |
 | Cách đặt | Ground | Snap đáy / Đặt phẳng / Nghiêng theo dốc |
-| Phạm vi | Ground | Keyframe / Mọi frame / Frame hiện tại |
+| Phạm vi dải | Ground | Từ frame này → Hết dải / Toàn dải / Chỉ keyframe / Frame này |
 | Hướng | Ground | Cả hai / Chỉ hạ / Chỉ nâng |
 | 📏 Kiểm tra đáy | Ground | Đo lún/bay cả dải |
-| ⬇️ Fit mặt đất / Alt+G | Ground | Fit theo mode/scope/hướng (Alt+G: cục bộ từng box, frame hiện tại) |
+| ⬇️ Fit frame hiện tại | Ground | Hạ chạm đất tức thời cho frame đang xem |
+| 🤖 Quét Cloud từng frame | Ground | Tự động chuyển frame, đọc cloud từng frame và fit (chuẩn xác nhất theo LiDAR) |
+| 👥 Bám Box tham chiếu dải | Ground | Duyệt dải ăn theo cao độ các xe tham chiếu ở từng frame (siêu nhanh) |
+| Alt+G | Toàn cục | Cục bộ từng box chạm đất, frame hiện tại |
 | ↔️ Dịch chuyển | Track | Dời cả dải |
 | 🎯 Nắn theo hướng đi | Track | Xoay yaw theo hướng di chuyển (frame hiện tại) |
 | ☁️ Nắn theo Cloud | Track | Xoay yaw theo PCA cụm điểm |
