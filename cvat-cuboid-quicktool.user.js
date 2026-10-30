@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         CVAT Cuboid Toolbox (3D) v3.3.0
+// @name         CVAT Cuboid Toolbox (3D) v3.4.0
 // @namespace    https://github.com/vantixapps/cvat-tools
-// @version      3.3.0
-// @description  Toolbox 3D cuboid cho CVAT: thao tác kiểu Blender, LWH/preset, mặt đất theo point cloud & box tham chiếu, kế thừa frame trước, track tools, QA + auto-fix có xem trước.
+// @version      3.4.0
+// @description  Toolbox 3D cuboid cho CVAT: header Target/Dải toàn cục, thao tác kiểu Blender, LWH/preset, quét cloud đa frame, bám box tham chiếu, track tools, QA + auto-fix có xem trước.
 // @author       Antigravity
 // @match        https://cvat-test.vantixapps.net/*
 // @match        https://app.cvat.ai/*
@@ -24,7 +24,7 @@
   // =========================================================================
   // Cấu hình + localStorage
   // =========================================================================
-  const VERSION = '3.3.0';
+  const VERSION = '3.4.0';
   const LOG = '[CVAT-Toolbox]';
 
   const LS = {
@@ -832,6 +832,18 @@
     return null;
   }
 
+  // Point cloud chỉ có cho frame đang hiển thị => chuyển frame rồi chờ CVAT nạp cloud mới
+  async function cloudAtFrame(f, prev) {
+    if (getFrame() === f && prev) return prev;
+    if (!(await goToFrame(f))) return null;
+    for (let t = 0; t < 50; t++) {
+      const pos = getPointCloudPositions();
+      if (pos && pos !== prev) return pos;
+      await sleep(100);
+    }
+    return null;
+  }
+
   // Mesh cuboid trong view perspective (CVAT đặt name = clientID)
   function findDrawnMesh(id) {
     const scene = getPerspectiveView()?.scene;
@@ -1296,23 +1308,70 @@
     return calcGroundPlane();
   }
 
+  async function resolveGroundRange(targetId) {
+    const scope = val('cqt-ground-scope') || 'current_to_end';
+    const curFrame = getFrame();
+    if (!Number.isInteger(curFrame)) {
+      fail('Không đọc được frame hiện tại.');
+      return null;
+    }
+    if (scope === 'current') {
+      return { from: curFrame, to: curFrame, keyframesOnly: false };
+    }
+
+    let start = intVal('cqt-frame-start');
+    let end = intVal('cqt-frame-end');
+
+    // Nếu start/end chưa có hoặc start === end === curFrame, tự động dò span của track
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start > end || (start === end && start === curFrame)) {
+      const span = await detectSpan(targetId);
+      if (span) {
+        start = span.startFrame;
+        end = span.endFrame;
+        setField('cqt-frame-start', start);
+        setField('cqt-frame-end', end);
+        setField('cqt-frame-count', end - start + 1);
+      }
+    }
+
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start > end) {
+      fail('Dải frame không hợp lệ (Start <= End). Bấm "🔍 Dò dải" để lấy dải.');
+      return null;
+    }
+
+    let from = start, to = end;
+    if (scope === 'current_to_end') {
+      from = curFrame;
+      to = end;
+      if (from > to) {
+        fail(`Frame hiện tại (${curFrame}) lớn hơn End frame (${end}).`);
+        return null;
+      }
+    }
+
+    const keyframesOnly = scope === 'keyframes';
+    return { from, to, keyframesOnly };
+  }
+
   function groundRange(range) {
-    if (val('cqt-ground-scope') !== 'current') return { from: range.startFrame, to: range.endFrame };
+    const scope = val('cqt-ground-scope') || 'current_to_end';
     const f = getFrame();
-    return Number.isInteger(f) ? { from: f, to: f } : null;
+    if (scope === 'current') return Number.isInteger(f) ? { from: f, to: f } : null;
+    if (scope === 'current_to_end' && Number.isInteger(f)) return { from: f, to: range.endFrame };
+    return { from: range.startFrame, to: range.endFrame };
   }
 
   async function checkGround() {
-    const range = readRange();
-    if (!range) return;
+    const id = requireTarget();
+    if (id === null) return;
     const plane = await ensureGroundPlane();
     if (!plane) return;
-    const r = groundRange(range);
-    if (!r) return fail('Không đọc được frame hiện tại.');
+    const r = await resolveGroundRange(id);
+    if (!r) return;
 
-    setStatus(`⏳ Đang đo đáy #${range.targetId}...`);
+    setStatus(`⏳ Đang đo đáy #${id} (${r.from} → ${r.to})...`);
     let minGap = Infinity, maxGap = -Infinity, frames = 0, sunk = 0, floating = 0;
-    for (const { state } of await collectTrack(range.targetId, r.from, r.to)) {
+    for (const { state } of await collectTrack(id, r.from, r.to)) {
       const gap = groundGap(state.points, plane);
       frames++;
       if (gap < -0.01) sunk++;
@@ -1320,11 +1379,214 @@
       minGap = Math.min(minGap, gap);
       maxGap = Math.max(maxGap, gap);
     }
-    if (!frames) return fail(`Không thấy #${range.targetId} trong dải.`);
+    if (!frames) return fail(`Không thấy #${id} trong dải.`);
     setStatus(
-      `📏 Đáy #${range.targetId} so với mặt đất: min ${fmtSigned(minGap, 3)}m, max ${fmtSigned(maxGap, 3)}m ` +
+      `📏 Đáy #${id} so với mặt đất: min ${fmtSigned(minGap, 3)}m, max ${fmtSigned(maxGap, 3)}m ` +
       `trên ${frames} frame. ${sunk} lún, ${floating} lơ lửng >1cm.`,
       sunk + floating ? 'warn' : 'success'
+    );
+  }
+
+  async function applyGroundFitCurrent() {
+    const id = requireTarget();
+    if (id === null) return;
+    const plane = await ensureGroundPlane();
+    if (!plane) return;
+    const frame = getFrame();
+    if (!Number.isInteger(frame)) return fail('Không đọc được frame hiện tại.');
+
+    const s = await getState(id, frame);
+    if (!isCuboid(s) || s.outside) return fail(`Không thấy cuboid #${id} ở frame ${frame}.`);
+
+    const mode = val('cqt-ground-mode') || 'snap';
+    const direction = val('cqt-ground-direction') || 'both';
+
+    const batch = createBatch('Fit mặt đất frame hiện tại');
+    let dz = 0;
+    await batch.edit(s, frame, (st) => {
+      const after = fitToGround(st.points, plane, mode);
+      dz = after[2] - st.points[2];
+      const rotChanged = Math.abs(after[3] - st.points[3]) > 1e-6 || Math.abs(after[4] - st.points[4]) > 1e-6;
+      if (Math.abs(dz) < 1e-4 && !rotChanged) return false;
+      if ((direction === 'down' && dz > 0) || (direction === 'up' && dz < 0)) return false;
+      st.points = after;
+      return true;
+    });
+
+    const res = await batch.finish();
+    if (!res.changed) return setStatus('ℹ️ Box đã nằm đúng trên mặt đất.', 'success');
+    setStatus(`✅ Đã fit mặt đất #${id} @f${frame} (dz ${fmtSigned(dz, 3)}m).` + editSuffix(res), 'success');
+  }
+
+  async function groundSweepCloud() {
+    const id = requireTarget();
+    if (id === null) return;
+    const r = await resolveGroundRange(id);
+    if (!r) return;
+
+    const mode = val('cqt-ground-mode') || 'snap';
+    const direction = val('cqt-ground-direction') || 'both';
+    const autoFallback = isChecked('cqt-ground-auto-fallback');
+    const totalFrames = r.to - r.from + 1;
+
+    if (totalFrames > 30) {
+      if (!confirm(`Quét Cloud từng frame cho #${id} từ frame ${r.from} đến ${r.to} (${totalFrames} frame)?\nQuá trình sẽ chuyển frame tự động để nạp point cloud của từng frame.`)) {
+        return;
+      }
+    }
+
+    const originalFrame = getFrame();
+    setStatus(`⏳ Bắt đầu quét Cloud #${id}: frame ${r.from} → ${r.to}...`);
+
+    const batch = createBatch('Quét Cloud fit đất dải');
+    let prevPos = null;
+    let fitted = 0, noCloud = 0, skipped = 0, fallbackCount = 0;
+    let lastGoodPlane = groundPlane;
+    let minDz = Infinity, maxDz = -Infinity;
+
+    for (let f = r.from; f <= r.to; f++) {
+      const s = await getState(id, f);
+      if (!isCuboid(s) || s.outside) { skipped++; continue; }
+      if (r.keyframesOnly && !isKey(s)) { skipped++; continue; }
+
+      setStatus(`⏳ Đang quét Cloud #${id}: frame ${f}/${r.to} (đã fit ${fitted})...`);
+      const pos = await cloudAtFrame(f, prevPos);
+      let plane = null;
+      if (pos) {
+        prevPos = pos;
+        plane = estimateGroundPlane(s.points, pos);
+      }
+
+      if (plane) {
+        lastGoodPlane = plane;
+        groundPlaneCache.set(f, { ...plane, source: `cloud @f${f}`, frame: f });
+      } else if (autoFallback && lastGoodPlane) {
+        plane = lastGoodPlane;
+        fallbackCount++;
+      } else {
+        noCloud++;
+        continue;
+      }
+
+      await batch.edit(s, f, (st) => {
+        const after = fitToGround(st.points, plane, mode);
+        const dz = after[2] - st.points[2];
+        const rotChanged = Math.abs(after[3] - st.points[3]) > 1e-6 || Math.abs(after[4] - st.points[4]) > 1e-6;
+        if (Math.abs(dz) < 1e-4 && !rotChanged) return false;
+        if ((direction === 'down' && dz > 0) || (direction === 'up' && dz < 0)) return false;
+        st.points = after;
+        minDz = Math.min(minDz, dz);
+        maxDz = Math.max(maxDz, dz);
+        return true;
+      });
+      fitted++;
+    }
+
+    const res = await batch.finish();
+    if (originalFrame !== getFrame()) {
+      await goToFrame(originalFrame);
+    }
+
+    if (!res.changed) {
+      return setStatus(
+        noCloud ? `⚠️ Không đủ điểm cloud để fit (${noCloud} frame thiếu).` : 'ℹ️ Các frame đã nằm sát mặt đất.',
+        noCloud ? 'warn' : 'success'
+      );
+    }
+
+    setStatus(
+      `🤖 Đã quét Cloud & fit ${res.changed} frame cho #${id} (dz ${fmtSigned(minDz, 3)} → ${fmtSigned(maxDz, 3)}m)` +
+      (fallbackCount ? `, ${fallbackCount} frame kế thừa` : '') +
+      (noCloud ? `, ${noCloud} frame bỏ qua do mất cloud` : '') + editSuffix(res),
+      'success'
+    );
+  }
+
+  async function groundFollowReference() {
+    const id = requireTarget();
+    if (id === null) return;
+    const refIds = getReferenceBoxIds();
+    if (!refIds.length) {
+      return fail('Cần ít nhất 1-2 box tham chiếu. Hãy nhập ID vào ô tham chiếu hoặc Shift+Click chọn trên canvas.');
+    }
+
+    const r = await resolveGroundRange(id);
+    if (!r) return;
+
+    const mode = val('cqt-ground-mode') || 'snap';
+    const direction = val('cqt-ground-direction') || 'both';
+    const autoFallback = isChecked('cqt-ground-auto-fallback');
+
+    setStatus(`⏳ Đang bám theo ${refIds.length} box tham chiếu (#${refIds.join(', #')}) từ frame ${r.from} đến ${r.to}...`);
+
+    const batch = createBatch('Bám box tham chiếu dải');
+    let fitted = 0, noRef = 0, skipped = 0;
+    let lastGoodPlane = groundPlane;
+    let minDz = Infinity, maxDz = -Infinity;
+
+    for (let f = r.from; f <= r.to; f++) {
+      const s = await getState(id, f);
+      if (!isCuboid(s) || s.outside) { skipped++; continue; }
+      if (r.keyframesOnly && !isKey(s)) { skipped++; continue; }
+
+      const validBoxes = [];
+      const pts = [];
+      for (const rid of refIds) {
+        const rs = await getState(rid, f);
+        if (!isCuboid(rs) || rs.outside) continue;
+        validBoxes.push(rs);
+        const corners = boxCorners(rs.points);
+        corners.sort((a, b) => a[2] - b[2]);
+        for (let i = 0; i < 4; i++) pts.push(corners[i]);
+      }
+
+      let plane = null;
+      if (validBoxes.length >= 2) {
+        plane = fitPlaneLSQ(pts);
+        const slope = plane ? Math.atan(Math.hypot(plane.a, plane.b)) * DEG : 0;
+        if (!plane || slope > 15) {
+          plane = flatPlane(median(pts.map((p) => p[2])));
+        }
+      } else if (validBoxes.length === 1) {
+        plane = flatPlane(bottomZ(validBoxes[0].points));
+      }
+
+      if (plane) {
+        lastGoodPlane = plane;
+        groundPlaneCache.set(f, { ...plane, source: `ref boxes @f${f}`, frame: f });
+      } else if (autoFallback && lastGoodPlane) {
+        plane = lastGoodPlane;
+      } else {
+        noRef++;
+        continue;
+      }
+
+      await batch.edit(s, f, (st) => {
+        const after = fitToGround(st.points, plane, mode);
+        const dz = after[2] - st.points[2];
+        const rotChanged = Math.abs(after[3] - st.points[3]) > 1e-6 || Math.abs(after[4] - st.points[4]) > 1e-6;
+        if (Math.abs(dz) < 1e-4 && !rotChanged) return false;
+        if ((direction === 'down' && dz > 0) || (direction === 'up' && dz < 0)) return false;
+        st.points = after;
+        minDz = Math.min(minDz, dz);
+        maxDz = Math.max(maxDz, dz);
+        return true;
+      });
+      fitted++;
+    }
+
+    const res = await batch.finish();
+    if (!res.changed) {
+      return setStatus(
+        noRef ? `⚠️ Không tìm thấy box tham chiếu ở các frame (${noRef} frame).` : 'ℹ️ Các frame đã đúng cao độ.',
+        noRef ? 'warn' : 'success'
+      );
+    }
+
+    setStatus(
+      `👥 Đã bám box tham chiếu & fit ${res.changed} frame cho #${id} (dz ${fmtSigned(minDz, 3)} → ${fmtSigned(maxDz, 3)}m)` +
+      (noRef ? `, ${noRef} frame không có ref` : '') + editSuffix(res),
+      'success'
     );
   }
 
@@ -1363,7 +1625,7 @@
       if (!res.seen) return fail(`Không thấy #${range.targetId} trong dải.`);
       return setStatus(
         keyframesOnly && res.skipped === res.seen
-          ? 'ℹ️ Không có keyframe nào trong dải. Chọn phạm vi "Mọi frame".'
+          ? 'ℹ️ Không có keyframe nào trong dải. Chọn phạm vi khác hoặc Mọi frame.'
           : `ℹ️ Không có frame nào cần đổi${skippedDir ? ` (bỏ qua ${skippedDir} do hướng "${direction}")` : ''}.`,
         'warn'
       );
@@ -2676,18 +2938,6 @@
     for (const r of rows) r.itemId = names.get(r.frame) || '';
   }
 
-  // Point cloud chỉ có cho frame đang hiển thị => chuyển frame rồi chờ CVAT nạp cloud mới
-  async function cloudAtFrame(f, prev) {
-    if (getFrame() === f && prev) return prev;
-    if (!(await goToFrame(f))) return null;
-    for (let t = 0; t < 50; t++) {
-      const pos = getPointCloudPositions();
-      if (pos && pos !== prev) return pos;
-      await sleep(100);
-    }
-    return null;
-  }
-
   // Chưa chạm đất: so góc thấp nhất của box với mặt đất cục bộ đo từ cloud (estimateGroundPlane).
   // Mỗi dòng lưu kèm plane để auto-fix hạ/nâng đúng frame đó.
   async function scanGroundRows(data, opts) {
@@ -3989,6 +4239,26 @@
         <button data-cam="side" class="cqt-btn cqt-btn-secondary cqt-sm" title="Nhìn sườn xe (Numpad 3 / Alt+3)">↔️ Side</button>
       </div>
 
+      <!-- Persistent Global Target & Frame Range Bar (hiển thị trên tất cả các tab) -->
+      <div class="cqt-global-bar" style="background:#1e293b; border-bottom:1px solid #334155; padding:6px 10px;">
+        <div class="cqt-row" style="align-items:center; justify-content:space-between; margin-bottom:4px;">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span class="cqt-label" style="font-weight:700; color:#38bdf8;">Target:</span>
+            <input type="number" id="cqt-target-id" class="cqt-input" placeholder="ID" style="width:68px; height:24px; padding:2px 6px; font-weight:bold;" title="Nhập ID object hoặc chọn trên canvas" />
+            <button id="cqt-btn-detect" class="cqt-btn cqt-btn-secondary cqt-sm cqt-none" title="Lấy object đang chọn trên canvas">🎯 Auto</button>
+          </div>
+          <span class="cqt-label">Frame: <b id="cqt-current-frame" style="color:#38bdf8;">?</b></span>
+        </div>
+        <div class="cqt-row" style="align-items:center; gap:4px;">
+          <span class="cqt-label" style="color:#94a3b8; font-size:11px;">Dải:</span>
+          <input type="number" id="cqt-frame-start" class="cqt-input" value="0" style="width:52px; height:24px; padding:2px 4px;" title="Start Frame" />
+          <span style="color:#64748b;">→</span>
+          <input type="number" id="cqt-frame-end" class="cqt-input" value="0" style="width:52px; height:24px; padding:2px 4px;" title="End Frame" />
+          <input type="number" min="1" id="cqt-frame-count" class="cqt-input" value="1" style="width:44px; height:24px; padding:2px 4px;" title="Số frame" />
+          <button id="cqt-btn-detect-span" class="cqt-btn cqt-btn-secondary cqt-sm cqt-none" style="margin-left:auto;" title="Dò frame đầu/cuối của object trong job">🔍 Dò dải</button>
+        </div>
+      </div>
+
       <div class="cqt-tabs">
         <button class="cqt-tab active" data-tab="object">Object</button>
         <button class="cqt-tab" data-tab="ground">Ground</button>
@@ -4000,14 +4270,6 @@
       <div id="cvat-quicktool-body">
         <!-- ================= OBJECT ================= -->
         <div class="cqt-pane active" data-pane="object">
-          <div class="cqt-row">
-            <div class="cqt-col">
-              <span class="cqt-label">Target Object ID (trống = object đang chọn)</span>
-              <input type="number" id="cqt-target-id" class="cqt-input" placeholder="Ví dụ: 13" />
-            </div>
-            <button id="cqt-btn-detect" class="cqt-btn cqt-btn-secondary cqt-none" style="margin-top:17px;" title="Lấy object đang chọn">🎯 Auto</button>
-          </div>
-
           <div class="cqt-row">
             <button id="cqt-btn-smart-snap" class="cqt-btn cqt-btn-ground" title="Hút box theo cụm điểm LiDAR: căn tâm, xoay theo dáng xe, đặt đáy lên mặt đất (Alt+S)">🧲 Smart Snap (Alt+S)</button>
             <label class="cqt-check" title="Bật: tính lại cả L/W/H theo cụm điểm. Tắt: giữ LWH, bám mặt gần cảm biến."><input type="checkbox" id="cqt-snap-fit-size" /> Fit size</label>
@@ -4032,16 +4294,6 @@
               <button id="cqt-btn-multi-shift" class="cqt-btn cqt-btn-secondary cqt-sm cqt-none" title="Dịch các box đã chọn tại frame hiện tại">↔️ Dịch</button>
             </div>
             <div class="cqt-hint">Giữ <b>Shift + Click</b> object trên canvas hoặc danh sách để thêm/bớt. Rê chuột lên canvas bấm <b>G / W / S</b> để di chuyển / xoay (quanh tâm nhóm) / co giãn cả nhóm.</div>
-          </div>
-
-          <div class="cqt-row">
-            <div class="cqt-col"><span class="cqt-label">Start Frame</span><input type="number" id="cqt-frame-start" class="cqt-input" value="0" /></div>
-            <div class="cqt-col"><span class="cqt-label">End Frame</span><input type="number" id="cqt-frame-end" class="cqt-input" value="0" /></div>
-            <div class="cqt-col"><span class="cqt-label">Số frame</span><input type="number" min="1" id="cqt-frame-count" class="cqt-input" /></div>
-          </div>
-          <div class="cqt-row" style="justify-content:space-between;">
-            <span class="cqt-label">Frame hiện tại: <b id="cqt-current-frame" style="color:#1890ff;">?</b></span>
-            <button id="cqt-btn-detect-span" class="cqt-btn cqt-btn-secondary cqt-sm cqt-none" title="Dò frame đầu/cuối mà object tồn tại">🔍 Tự lấy dải frame</button>
           </div>
 
           <div class="cqt-divider"></div>
@@ -4135,11 +4387,12 @@
           </div>
           <div class="cqt-row">
             <div class="cqt-col">
-              <span class="cqt-label">Phạm vi</span>
+              <span class="cqt-label">Phạm vi dải</span>
               <select id="cqt-ground-scope" class="cqt-input">
-                <option value="keyframes">Keyframe trong dải</option>
-                <option value="all">Mọi frame (bake)</option>
-                <option value="current">Frame hiện tại</option>
+                <option value="current_to_end">Từ frame này → Hết dải</option>
+                <option value="whole">Toàn bộ dải Start–End</option>
+                <option value="keyframes">Chỉ keyframe trong dải</option>
+                <option value="current">Chỉ frame hiện tại</option>
               </select>
             </div>
             <div class="cqt-col">
@@ -4153,10 +4406,19 @@
           </div>
           <label class="cqt-check" title="Khi chạy dải frame hoặc Alt+G, nếu thiếu điểm cloud sẽ tự động dùng plane của frame hợp lệ trước đó"><input type="checkbox" id="cqt-ground-auto-fallback" checked /> Tự kế thừa plane frame trước khi mất cloud</label>
           <div class="cqt-row">
-            <button id="cqt-btn-check-ground" class="cqt-btn cqt-btn-secondary">📏 Kiểm tra đáy</button>
-            <button id="cqt-btn-apply-ground" class="cqt-btn cqt-btn-ground">⬇️ Fit mặt đất</button>
+            <button id="cqt-btn-apply-ground-frame" class="cqt-btn cqt-btn-ground" title="Hạ chạm đất ngay cho frame hiện tại theo mặt phẳng đang lưu">⬇️ Fit frame hiện tại</button>
+            <button id="cqt-btn-check-ground" class="cqt-btn cqt-btn-secondary" title="Đo độ lệch đáy so với mặt đất trong dải">📏 Kiểm tra đáy</button>
           </div>
-          <div class="cqt-hint">Plane dốc tính từ cloud hoặc box tham chiếu; <b>⏮️</b> kế thừa frame trước khi mất cloud. <b>Alt+G</b>: tự tính mặt đất quanh từng object (đang chọn) và hạ chạm đất ở frame hiện tại.</div>
+          <div class="cqt-row">
+            <button id="cqt-btn-ground-sweep-cloud" class="cqt-btn cqt-btn-secondary" style="border-color:#38bdf8; color:#38bdf8;" title="Tự động chuyển frame, đọc point cloud từng frame để fit mặt đất (triệt tiêu lệch toạ độ Ego sensor)">🤖 Quét Cloud từng frame</button>
+            <button id="cqt-btn-ground-follow-ref" class="cqt-btn cqt-btn-secondary" style="border-color:#a855f7; color:#c084fc;" title="Tự động bám theo các box tham chiếu ở từng frame trong dải (chạy tức thời)">👥 Bám Box tham chiếu dải</button>
+          </div>
+          <div class="cqt-hint">
+            • <b>⬇️ Fit frame hiện tại</b>: Hạ ngay tại frame đang xem.<br>
+            • <b>🤖 Quét Cloud</b>: Tự tải point cloud từng frame để fit độc lập (chuẩn xác nhất theo LiDAR).<br>
+            • <b>👥 Bám Box tham chiếu</b>: Duyệt dải ăn theo cao độ các xe tham chiếu ở từng frame (siêu nhanh).<br>
+            • <b>Alt+G</b>: Tự tính mặt đất quanh từng object và hạ chạm đất ở frame hiện tại.
+          </div>
         </div>
 
         <!-- ================= TRACK ================= -->
@@ -4450,6 +4712,9 @@
     on('cqt-ground-z', onGroundZInput, 'change');
     on('cqt-btn-check-ground', checkGround);
     on('cqt-btn-apply-ground', applyGroundFit);
+    on('cqt-btn-apply-ground-frame', applyGroundFitCurrent);
+    on('cqt-btn-ground-sweep-cloud', groundSweepCloud);
+    on('cqt-btn-ground-follow-ref', groundFollowReference);
 
     // Track
     on('cqt-btn-shift', shiftTrack);
