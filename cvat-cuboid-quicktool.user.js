@@ -1,9 +1,10 @@
 // ==UserScript==
-// @name         CVAT Cuboid Toolbox (3D)
+// @name         CVAT Cuboid Toolbox (3D) v3.3.0
 // @namespace    https://github.com/vantixapps/cvat-tools
-// @version      3.1.0
-// @description  Toolbox 3D cuboid cho CVAT: thao tác kiểu Blender, LWH/preset, mặt đất theo point cloud, track tools, QA + auto-fix có xem trước.
+// @version      3.3.0
+// @description  Toolbox 3D cuboid cho CVAT: thao tác kiểu Blender, LWH/preset, mặt đất theo point cloud & box tham chiếu, kế thừa frame trước, track tools, QA + auto-fix có xem trước.
 // @author       Antigravity
+// @match        https://cvat-test.vantixapps.net/*
 // @match        https://app.cvat.ai/*
 // @match        http://localhost:8080/*
 // @match        http://127.0.0.1:8080/*
@@ -23,7 +24,7 @@
   // =========================================================================
   // Cấu hình + localStorage
   // =========================================================================
-  const VERSION = '3.1.0';
+  const VERSION = '3.3.0';
   const LOG = '[CVAT-Toolbox]';
 
   const LS = {
@@ -33,6 +34,8 @@
     limits: 'cqt_limits_v3',
     qa: 'cqt_qa_options_v3',
     settings: 'cqt_settings_v1',
+    classGroups: 'cqt_class_groups_v1',
+    attrProfiles: 'cqt_attr_profiles_v1',
   };
 
   // Ngưỡng LWH tiêu chuẩn theo class (m)
@@ -42,8 +45,18 @@
     pedestrian: { l: [0.65, 1.0], w: [0.65, 1.0], h: [1.2, 1.9] },
   };
 
-  // Tuỳ chọn QA (theo file kiểm tra cvat1.xlsx)
+  // Nhóm class chuẩn: tên nhóm => các tên nhãn được chấp nhận
+  const DEFAULT_CLASS_GROUPS = {
+    vehicle: ['vehicle', 'vehicles', 'car', 'cars', 'truck', 'trucks', 'bus', 'buses', 'van', 'vans', 'trailer', 'construction_vehicle'],
+    two_wheel: ['two_wheel', 'two_wheeler', 'two_wheelers', 'bicycle', 'bicycles', 'motorcycle', 'motorcycles', 'cyclist', 'cyclists', 'bike', 'bikes'],
+    pedestrian: ['pedestrian', 'pedestrians', 'person', 'people', 'human', 'child'],
+  };
+
+  // Tuỳ chọn QA (theo file kiểm tra cvat1.xlsx + 3 mục track_id / class_groups)
   const DEFAULT_QA = {
+    missingTrack: true, // Thiếu track_id
+    duplicateTrack: true, // Trùng track_id trong 1 frame
+    unknownClass: true, // Nhãn không thuộc class_groups
     scale: true,
     scaleTol: 0.005, // m: chênh lệch so với size chuẩn (median) của track
     yaw: true,
@@ -53,12 +66,16 @@
     dist: true,
     distThresh: 100, // m, tính từ gốc toạ độ
     limits: true,
+    ground: false, // đọc cloud từng frame => chậm, mặc định tắt
+    groundTol: 0.05, // m, lệch đáy so với mặt đất cục bộ
+    groundAll: false, // false = chỉ keyframe (frame nội suy đi theo), true = mọi frame
     wholeJob: true,
   };
 
   const DEFAULT_SETTINGS = {
-    blenderKeys: true, // G/R/S, Numpad 7/1/3/. trên canvas 3D
+    blenderKeys: true, // G/W/S, Numpad 7/1/3/. trên canvas 3D
     bounceRefresh: false, // làm mới canvas bằng cách chuyển frame (chậm, dự phòng)
+    enforceLimits: false, // ép LWH vào limits khi Áp dụng LWH / auto-fix (tắt = limits chỉ để cảnh báo)
   };
 
   function lsGet(key, fallback) {
@@ -249,38 +266,83 @@
     return { a, b, c: mz - a * mx - b * my };
   }
 
-  // Ước lượng mặt đất cục bộ quanh hộp từ point cloud (vành khuyên quanh footprint, lọc dần outlier)
+  // Độ cao lớp mặt đất trong 1 vùng: đỉnh "tập trung điểm" thấp nhất của histogram Z.
+  // Mặt đường gồ ghề vẫn là 1 lớp điểm dày; thân xe, bó vỉa, nhiễu thì thưa hơn hoặc cao hơn.
+  function groundPeakZ(zs, minCount = 8) {
+    if (zs.length < minCount) return null;
+    const BIN = 0.02, NB = 75; // xét 1.5 m phía trên điểm thấp
+    const lo = percentile(zs, 0.01);
+    const hist = new Float64Array(NB);
+    for (const z of zs) {
+      const k = Math.floor((z - lo) / BIN);
+      if (k >= 0 && k < NB) hist[k]++;
+    }
+    const KER = [0.06, 0.24, 0.4, 0.24, 0.06]; // làm mượt ~4 cm
+    const sm = new Float64Array(NB);
+    let max = 0;
+    for (let k = 0; k < NB; k++) {
+      for (let j = 0; j < 5; j++) sm[k] += KER[j] * (hist[k + j - 2] || 0);
+      max = Math.max(max, sm[k]);
+    }
+    if (max < 2) return null;
+    let k = 0;
+    while (sm[k] < 0.5 * max) k++; // lớp dày đầu tiên tính từ dưới lên
+    while (k + 1 < NB && sm[k + 1] >= sm[k]) k++; // leo tới đỉnh của lớp đó
+    const zc = lo + (k + 0.5) * BIN;
+    let sum = 0, n = 0;
+    for (const z of zs) if (Math.abs(z - zc) <= 0.04) { sum += z; n++; }
+    return n ? { z: sum / n, n } : null;
+  }
+
+  // Mặt đất cục bộ dưới hộp. Không fit 1 plane lớn (đường gồ ghề làm lệch),
+  // mà đo độ cao lớp đất ngay tại 4 góc đáy (chỗ bánh xe), rồi nối 4 điểm đó thành mặt nghiêng.
   function estimateGroundPlane(points, positions) {
     const cx = points[0], cy = points[1];
     const l = Math.abs(points[6]), w = Math.abs(points[7]);
-    const rOut = 0.5 * Math.hypot(l, w) + 4.5;
-    const cos = Math.cos(-points[5]), sin = Math.sin(-points[5]);
-    const inX = l / 2 + 0.3, inY = w / 2 + 0.3;
+    const cos = Math.cos(points[5]), sin = Math.sin(points[5]);
+    const rOut = 0.5 * Math.hypot(l, w) + 2.5;
+    const bz = bottomZ(points);
 
-    const ring = [];
+    const near = []; // [lx, ly, z, inside]
     for (let i = 0; i + 2 < positions.length; i += 3) {
       const z = positions[i + 2];
-      if (!Number.isFinite(z)) continue;
+      if (!Number.isFinite(z) || z < bz - 3 || z > bz + 2) continue;
       const dx = positions[i] - cx, dy = positions[i + 1] - cy;
       if (dx * dx + dy * dy > rOut * rOut) continue;
-      const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
-      if (Math.abs(lx) <= inX && Math.abs(ly) <= inY) continue;
-      ring.push([positions[i], positions[i + 1], z]);
+      const lx = dx * cos + dy * sin, ly = -dx * sin + dy * cos;
+      near.push([lx, ly, z, Math.abs(lx) <= l / 2 + 0.3 && Math.abs(ly) <= w / 2 + 0.3]);
     }
-    if (ring.length < 15) return null;
+    // 1) Mức đất chung: lớp dày thấp nhất ngoài footprint
+    const ref = groundPeakZ(near.filter((q) => !q[3]).map((q) => q[2]), 15);
+    if (!ref) return null;
 
-    ring.sort((a, b) => a[2] - b[2]);
-    const cut = ring[Math.floor(ring.length * 0.35)][2] + 0.15;
-    let ground = ring.filter((q) => q[2] <= cut);
-    let plane = fitPlaneLSQ(ground);
-    for (let iter = 0; plane && iter < 3; iter++) {
-      const kept = ground.filter((q) => Math.abs(q[2] - planeZ(plane, q[0], q[1])) <= 0.12);
-      if (kept.length < 10 || kept.length === ground.length) break;
-      ground = kept;
-      plane = fitPlaneLSQ(ground) || plane;
+    // 2) Đo lại tại từng góc đáy, chỉ trong cửa sổ ±0.3 m quanh mức chung (bỏ thân xe, bó vỉa)
+    // Bán kính đo nhỏ dần từ trong ra: càng sát góc càng đúng chỗ bánh xe, chỉ nới rộng khi thiếu điểm
+    const band = near.filter((q) => Math.abs(q[2] - ref.z) <= 0.3);
+    const samples = [];
+    let count = 0;
+    for (const [ax, ay] of [[l / 2, w / 2], [l / 2, -w / 2], [-l / 2, w / 2], [-l / 2, -w / 2]]) {
+      let pk = null;
+      for (const r of [0.5, 0.8, 1.2, 1.6]) {
+        const zs = [];
+        for (const q of band) {
+          const dx = q[0] - ax, dy = q[1] - ay;
+          if (dx * dx + dy * dy <= r * r) zs.push(q[2]);
+        }
+        if (zs.length >= 12 && (pk = groundPeakZ(zs, 12))) break;
+      }
+      if (!pk) continue;
+      count += pk.n;
+      samples.push([cx + ax * cos - ay * sin, cy + ax * sin + ay * cos, pk.z]);
     }
-    if (!plane || ground.length < 10) return null;
-    return { ...plane, slopeDeg: Math.atan(Math.hypot(plane.a, plane.b)) * DEG, count: ground.length };
+    // Góc bị thân xe che mất đất thường cho đỉnh cao bất thường => bỏ góc cao hơn góc thấp nhất > 0.2 m
+    const zMin = Math.min(...samples.map((s) => s[2]));
+    const good = samples.filter((s) => s[2] - zMin <= 0.2);
+
+    let plane = good.length >= 3 ? fitPlaneLSQ(good) : null;
+    if (plane && Math.atan(Math.hypot(plane.a, plane.b)) * DEG > 12) plane = null; // dốc vô lý => coi như phẳng
+    if (!plane) plane = flatPlane(good.length ? median(good.map((s) => s[2])) : ref.z);
+    return { ...plane, slopeDeg: Math.atan(Math.hypot(plane.a, plane.b)) * DEG, count: count || ref.n, corners: good.length };
   }
 
   // =========================================================================
@@ -305,18 +367,111 @@
     return out;
   }
 
-  // Trục chính của cụm điểm trên mặt XY (mod π)
-  function pcaYaw(pts) {
-    const n = pts.length;
+  // Hướng hộp theo "L-shape fitting" (Zhang et al. 2017, tiêu chí closeness).
+  // Thử mọi góc θ trong [0°, 90°): chiếu điểm lên 2 trục e1 = (cosθ, sinθ), e2 = (−sinθ, cosθ)
+  // (tích vô hướng trên mặt XY), rồi chấm điểm mức độ điểm dồn sát các cạnh hộp.
+  // Đúng hướng thì 2 mặt LiDAR nhìn thấy nằm gọn trên 2 cạnh => điểm cao nhất.
+  // PCA bị lệch vì khi chỉ thấy 2 mặt (chữ L), trục chính chạy chéo theo đường chéo chữ L.
+  // priors: [{ yaw, w }] hướng các box xung quanh (so theo mod 90°), chỉ để phân xử khi cloud mơ hồ.
+  // Trả về { yaw (mod 90°), conf (0 = mơ hồ … 1 = rõ) }.
+  function fitRectYaw(pts, priors = []) {
+    const step = Math.max(1, Math.floor(pts.length / 1200));
+    const xy = [];
     let mx = 0, my = 0;
-    for (const q of pts) { mx += q[0]; my += q[1]; }
-    mx /= n; my /= n;
-    let sxx = 0, syy = 0, sxy = 0;
-    for (const q of pts) {
-      const dx = q[0] - mx, dy = q[1] - my;
-      sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    for (let i = 0; i < pts.length; i += step) { xy.push(pts[i]); mx += pts[i][0]; my += pts[i][1]; }
+    mx /= xy.length; my /= xy.length;
+    const X = xy.map((q) => q[0] - mx), Y = xy.map((q) => q[1] - my);
+    const n = X.length, D0 = 0.04;
+    const c1 = new Float64Array(n), c2 = new Float64Array(n);
+    const closeness = (t) => {
+      const c = Math.cos(t), s = Math.sin(t);
+      for (let i = 0; i < n; i++) { c1[i] = X[i] * c + Y[i] * s; c2[i] = -X[i] * s + Y[i] * c; }
+      const s1 = Array.from(c1).sort((a, b) => a - b), s2 = Array.from(c2).sort((a, b) => a - b);
+      const k0 = Math.floor(0.01 * (n - 1)), k1 = Math.ceil(0.99 * (n - 1));
+      const lo1 = s1[k0], hi1 = s1[k1], lo2 = s2[k0], hi2 = s2[k1];
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const d1 = Math.max(0, Math.min(c1[i] - lo1, hi1 - c1[i]));
+        const d2 = Math.max(0, Math.min(c2[i] - lo2, hi2 - c2[i]));
+        sum += 1 / Math.max(Math.min(d1, d2), D0);
+      }
+      return sum;
+    };
+    let wSum = 0;
+    for (const p of priors) wSum += p.w;
+    const prior = (t) => {
+      if (!wSum) return 0;
+      let s = 0;
+      for (const p of priors) s += p.w * (1 + Math.cos(4 * (t - p.yaw))) / 2;
+      return s / wSum;
+    };
+    const lambda = n < 40 ? 0.6 : n < 150 ? 0.3 : 0.12;
+
+    const coarse = [];
+    for (let d = 0; d < 90; d++) coarse.push(closeness(d * RAD));
+    const sMax = Math.max(...coarse), sMin = Math.min(...coarse), span = sMax - sMin || 1;
+    const total = (t, s) => (s - sMin) / span + lambda * prior(t);
+    let bestD = 0;
+    for (let d = 1; d < 90; d++) if (total(d * RAD, coarse[d]) > total(bestD * RAD, coarse[bestD])) bestD = d;
+    let best = bestD * RAD;
+    // Tinh chỉnh dưới 1°: gán điểm vào cạnh gần nhất, fit đường thẳng (TLS) cho từng cạnh,
+    // rồi lấy trung bình hướng các cạnh (trong không gian 4θ để cạnh dọc/ngang cùng một nghĩa).
+    for (let iter = 0; iter < 3; iter++) {
+      const c = Math.cos(best), s = Math.sin(best);
+      for (let i = 0; i < n; i++) { c1[i] = X[i] * c + Y[i] * s; c2[i] = -X[i] * s + Y[i] * c; }
+      const s1 = Array.from(c1).sort((u, v) => u - v), s2 = Array.from(c2).sort((u, v) => u - v);
+      const k0 = Math.floor(0.01 * (n - 1)), k1 = Math.ceil(0.99 * (n - 1));
+      const bounds = [s1[k0], s1[k1], s2[k0], s2[k1]];
+      const groups = [[], [], [], []];
+      for (let i = 0; i < n; i++) {
+        const ds = [c1[i] - bounds[0], bounds[1] - c1[i], c2[i] - bounds[2], bounds[3] - c2[i]].map(Math.abs);
+        const k = ds.indexOf(Math.min(...ds));
+        if (ds[k] < 0.25) groups[k].push(i);
+      }
+      let vc = 0, vs = 0;
+      groups.forEach((g, k) => {
+        if (g.length < 8) return;
+        let gx = 0, gy = 0;
+        for (const i of g) { gx += X[i]; gy += Y[i]; }
+        gx /= g.length; gy /= g.length;
+        let sxx = 0, syy = 0, sxy = 0;
+        for (const i of g) { const dx = X[i] - gx, dy = Y[i] - gy; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+        const dir = 0.5 * Math.atan2(2 * sxy, sxx - syy); // hướng cạnh
+        const spread = Math.sqrt((sxx + syy) / g.length);
+        if (spread < 0.3) return; // cạnh quá ngắn, hướng không tin được
+        const th = k < 2 ? dir - Math.PI / 2 : dir; // cạnh vuông góc e1 có hướng e2 = θ + 90°
+        vc += g.length * Math.cos(4 * th);
+        vs += g.length * Math.sin(4 * th);
+      });
+      if (!vc && !vs) break;
+      let th = Math.atan2(vs, vc) / 4;
+      while (angleDiff(th, best) > Math.PI / 4 + 1e-9) th += Math.PI / 2; // về cùng nhánh với best
+      th = ((th % (Math.PI / 2)) + Math.PI / 2) % (Math.PI / 2);
+      if (Math.abs(Math.sin(2 * (th - best))) > Math.sin(2 * 3 * RAD)) break; // lệch > 3° => giữ kết quả thô
+      const moved = Math.abs(Math.sin(2 * (th - best)));
+      best = th;
+      if (moved < 1e-4) break;
     }
-    return 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    // Độ rõ: đỉnh tốt nhất trội hơn mọi hướng cách nó > 10° bao nhiêu (theo closeness thuần)
+    let rival = 0;
+    for (let d = 0; d < 90; d++) {
+      const gap = Math.abs(((d - bestD) % 90 + 135) % 90 - 45);
+      if (gap > 10) rival = Math.max(rival, (coarse[d] - sMin) / span);
+    }
+    return { yaw: best, conf: 1 - rival };
+  }
+
+  // Hướng các box xung quanh làm "gợi ý" cho fitRectYaw (chỉ box dài, trong 30 m)
+  function yawPriors(p, others) {
+    const out = [];
+    for (const q of others) {
+      const l = Math.abs(q[6]), w = Math.abs(q[7]);
+      if (Math.max(l, w) < 1.4 * Math.min(l, w)) continue;
+      const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+      if (d < 0.5 || d > 30) continue;
+      out.push({ yaw: q[5], w: 1 / (1 + d / 10) });
+    }
+    return out;
   }
 
   // Trong 4 hướng yaw + k·90°, chọn hướng gần góc hiện tại nhất (giữ L theo đầu xe)
@@ -478,6 +633,45 @@
 
   function isCuboid(s) {
     return !!s?.points && s.points.length >= 9;
+  }
+
+  // Thuộc tính (sub label) của label. CVAT lưu giá trị theo ID số: state.attributes = { [attrId]: 'value' }
+  function attrSpecs(state) {
+    return Array.isArray(state?.label?.attributes) ? state.label.attributes : [];
+  }
+
+  function findAttrSpec(state, pattern) {
+    return attrSpecs(state).find((a) => pattern.test(String(a.name || '').trim())) || null;
+  }
+
+  function attrValue(state, spec) {
+    return state?.attributes?.[spec.id];
+  }
+
+  // Setter attributes của ObjectState gộp key, không xoá thuộc tính khác
+  function setAttr(state, spec, value) {
+    state.attributes = { [spec.id]: String(value) };
+  }
+
+  const TRACK_ID_ATTR = /^track[\s_-]?id$/i;
+
+  // { key, value, source }: source 'attr' (thuộc tính track_id), 'track' (track của CVAT), null = thiếu
+  function trackIdOf(state) {
+    const spec = findAttrSpec(state, TRACK_ID_ATTR);
+    if (spec) {
+      const raw = attrValue(state, spec);
+      if (raw === undefined || raw === null || String(raw).trim() === '') return { key: null, value: null, source: null, spec };
+      const n = parseInt(raw, 10);
+      const value = Number.isInteger(n) && String(n) === String(raw).trim() ? n : String(raw).trim();
+      return { key: 'a:' + value, value, source: 'attr', spec };
+    }
+    if (state?.objectType === 'track') return { key: 'c:' + state.clientID, value: state.clientID, source: 'track', spec: null };
+    return { key: null, value: null, source: null, spec: null };
+  }
+
+  function jobLabels() {
+    const labels = getJob()?.labels;
+    return Array.isArray(labels) ? labels : [];
   }
 
   // Track: chỉ keyframe; shape: luôn coi như keyframe
@@ -904,10 +1098,16 @@
   // =========================================================================
   // Mặt đất: một "ground plane" duy nhất (dốc từ point cloud, hoặc phẳng theo Z)
   // =========================================================================
-  let groundPlane = null; // { a, b, c, slopeDeg, count?, source }
+  let groundPlane = null; // { a, b, c, slopeDeg, count?, source, frame? }
+  const groundPlaneCache = new Map(); // frame -> { ...plane, source, frame }
 
   function setGroundPlane(plane, source, refPoints) {
-    groundPlane = { ...plane, source };
+    const f = getFrame();
+    const planeData = { ...plane, source, frame: Number.isInteger(f) ? f : null };
+    groundPlane = planeData;
+    if (Number.isInteger(f)) {
+      groundPlaneCache.set(f, planeData);
+    }
     const el = $('cqt-plane-display');
     if (el) {
       const z0 = refPoints ? planeZ(plane, refPoints[0], refPoints[1]) : plane.c;
@@ -917,6 +1117,16 @@
         : `Mặt phẳng ngang Z = ${plane.c.toFixed(3)}m — ${source}`;
     }
     if (!(plane.a || plane.b)) setField('cqt-ground-z', plane.c.toFixed(3));
+  }
+
+  function findPrevGroundPlane(currentFrame) {
+    if (!Number.isInteger(currentFrame)) return null;
+    for (let f = currentFrame - 1; f >= 0; f--) {
+      if (groundPlaneCache.has(f)) {
+        return { frame: f, plane: groundPlaneCache.get(f) };
+      }
+    }
+    return null;
   }
 
   function onGroundZInput() {
@@ -935,12 +1145,127 @@
     if (id === null) return null;
     const s = await requireCuboidAtFrame(id);
     if (!s) return null;
-    if (!getPointCloudPositions()) return fail('Không đọc được point cloud.');
-    const plane = planeFromCloud(s.points);
-    if (!plane) return fail('Không đủ điểm quanh object để fit mặt đất.');
-    setGroundPlane(plane, `cloud quanh #${id} @f${getFrame()}`, s.points);
-    setStatus(`📐 Đã tính plane dốc ${plane.slopeDeg.toFixed(1)}° từ ${plane.count} điểm. Bấm "Fit mặt đất".`, 'success');
-    return plane;
+    const frame = getFrame();
+    let plane = null;
+    if (getPointCloudPositions()) {
+      plane = planeFromCloud(s.points);
+    }
+    if (plane) {
+      setGroundPlane(plane, `cloud quanh #${id} @f${frame}`, s.points);
+      setStatus(`📐 Đã tính plane dốc ${plane.slopeDeg.toFixed(1)}° từ ${plane.count} điểm. Bấm "Fit mặt đất".`, 'success');
+      return plane;
+    }
+    if (isChecked('cqt-ground-auto-fallback')) {
+      const prev = findPrevGroundPlane(frame);
+      if (prev) {
+        setGroundPlane(prev.plane, `kế thừa từ @f${prev.frame} (f${frame} thiếu cloud)`, s.points);
+        setStatus(`⏮️ Frame ${frame} thiếu điểm cloud: Đã tự động kế thừa plane từ frame ${prev.frame}.`, 'warn');
+        return prev.plane;
+      }
+    }
+    return fail('Không đủ điểm quanh object để fit mặt đất.');
+  }
+
+  async function inheritGroundFromPrevFrame() {
+    const frame = getFrame();
+    if (!Number.isInteger(frame)) return fail('Không đọc được frame hiện tại.');
+    if (frame <= 0) return fail('Đang ở frame đầu tiên (f=0), không có frame trước.');
+
+    let prev = findPrevGroundPlane(frame);
+    if (!prev) {
+      const targetId = resolveTargetId();
+      if (Number.isInteger(targetId)) {
+        const prevS = await getState(targetId, frame - 1);
+        if (isCuboid(prevS) && !prevS.outside) {
+          prev = { frame: frame - 1, plane: flatPlane(bottomZ(prevS.points)) };
+        }
+      }
+    }
+
+    if (!prev) {
+      return fail(`Chưa có plane ở các frame trước frame ${frame}. Hãy bấm "Plane từ cloud" hoặc chọn box ở frame trước.`);
+    }
+
+    const targetId = resolveTargetId();
+    const curS = Number.isInteger(targetId) ? await getState(targetId, frame) : null;
+    const refPts = curS && isCuboid(curS) ? curS.points : null;
+
+    setGroundPlane(prev.plane, `kế thừa từ @f${prev.frame}`, refPts);
+    setStatus(
+      `⏮️ Đã kế thừa ground từ frame ${prev.frame} (${prev.plane.slopeDeg ? `dốc ${prev.plane.slopeDeg.toFixed(1)}°` : `Z = ${prev.plane.c.toFixed(3)}m`}).`,
+      'success'
+    );
+    return prev.plane;
+  }
+
+  function getReferenceBoxIds() {
+    const raw = (val('cqt-ground-ref-ids') || '').trim();
+    const ids = new Set();
+    if (raw) {
+      for (const tok of raw.split(/[\s,]+/)) {
+        const id = parseInt(tok.replace(/^#/, ''), 10);
+        if (Number.isInteger(id)) ids.add(id);
+      }
+    }
+    if (selection.size) {
+      for (const id of selection) ids.add(id);
+    }
+    const targetId = resolveTargetId();
+    if (Number.isInteger(targetId)) ids.delete(targetId);
+    return [...ids];
+  }
+
+  async function groundFromReferenceBoxes() {
+    const frame = getFrame();
+    if (!Number.isInteger(frame)) return fail('Không đọc được frame hiện tại.');
+    const refIds = getReferenceBoxIds();
+    if (refIds.length < 2) {
+      return fail('Cần ít nhất 2 box tham chiếu. Hãy Shift+Click chọn các box trên canvas hoặc nhập ID vào ô tham chiếu.');
+    }
+
+    const validBoxes = [];
+    const pts = [];
+    for (const id of refIds) {
+      const s = await getState(id, frame);
+      if (!isCuboid(s) || s.outside) continue;
+      validBoxes.push(s);
+      const corners = boxCorners(s.points);
+      corners.sort((a, b) => a[2] - b[2]);
+      for (let i = 0; i < 4; i++) pts.push(corners[i]);
+    }
+
+    if (validBoxes.length < 2) {
+      return fail(`Chỉ có ${validBoxes.length} box hợp lệ tại frame ${frame}. Cần ít nhất 2 box.`);
+    }
+
+    let plane = fitPlaneLSQ(pts);
+    let slope = plane ? Math.atan(Math.hypot(plane.a, plane.b)) * DEG : 0;
+
+    // Dốc > 15° thường do chọn nhầm box không cùng mặt đường hoặc ngoại lai -> fallback về phẳng
+    if (!plane || slope > 15) {
+      const zs = pts.map((p) => p[2]);
+      const z = median(zs);
+      plane = flatPlane(z);
+      slope = 0;
+    }
+
+    const planeObj = {
+      ...plane,
+      slopeDeg: slope,
+      count: pts.length,
+    };
+
+    const targetId = resolveTargetId();
+    const curS = Number.isInteger(targetId) ? await getState(targetId, frame) : null;
+    const refPts = curS && isCuboid(curS) ? curS.points : null;
+
+    const boxLabels = validBoxes.map((b) => '#' + b.clientID).join(', ');
+    setGroundPlane(planeObj, `từ ${validBoxes.length} box tham chiếu (${boxLabels}) @f${frame}`, refPts);
+    setStatus(
+      `📐 Đã tính plane ${slope > 0 ? `dốc ${slope.toFixed(1)}°` : 'ngang'} từ đáy ${validBoxes.length} box tham chiếu (${boxLabels}). Bấm "Fit mặt đất".`,
+      'success'
+    );
+    return planeObj;
   }
 
   async function groundFromOthers() {
@@ -1063,7 +1388,11 @@
     for (const id of list) {
       const s = await getState(id, frame);
       if (!isCuboid(s) || s.outside) continue;
-      const plane = planeFromCloud(s.points) || groundPlane;
+      let plane = planeFromCloud(s.points) || groundPlane;
+      if (!plane && isChecked('cqt-ground-auto-fallback')) {
+        const prev = findPrevGroundPlane(frame);
+        if (prev) plane = prev.plane;
+      }
       if (!plane) { noCloud++; continue; }
       await batch.edit(s, frame, (st) => {
         const after = fitToGround(st.points, plane, mode);
@@ -1074,7 +1403,7 @@
     }
     const res = await batch.finish();
     if (!res.changed) {
-      return setStatus(noCloud ? '⚠️ Không đủ điểm cloud để tìm mặt đất.' : 'ℹ️ Đã nằm sát mặt đất.', noCloud ? 'error' : 'success');
+      return setStatus(noCloud ? '⚠️ Không đủ điểm cloud để tìm mặt đất (và không có plane frame trước).' : 'ℹ️ Đã nằm sát mặt đất.', noCloud ? 'error' : 'success');
     }
     setStatus(`⬇️ Đã hạ chạm đất ${res.changed} object tại frame ${frame}.` + editSuffix(res), 'success');
   }
@@ -1083,12 +1412,26 @@
   // Smart Snap: hút box theo cụm điểm LiDAR
   // =========================================================================
 
-  // Trả về { points, n } hoặc { error }.
+  // Điểm của object trong box (đã bỏ lớp mặt đất) + mặt đất cục bộ
+  function objectPoints(p, positions, margin) {
+    const plane = estimateGroundPlane(p, positions);
+    let pts = pointsInBox(p, positions, margin);
+    if (plane) {
+      pts = pts.filter((q) => q[2] - planeZ(plane, q[0], q[1]) > 0.15);
+    } else if (pts.length) {
+      const floor = percentile(pts.map((q) => q[2]), 0.02) + 0.15;
+      pts = pts.filter((q) => q[2] > floor);
+    }
+    return { pts, plane };
+  }
+
+  // Trả về { points, n, conf } hoặc { error }.
+  // priors: hướng các box xung quanh (xem yawPriors), giúp khi cloud thưa / chỉ thấy 1 mặt.
   // Lặp: mỗi lượt cắt lại cụm điểm theo box của lượt trước, để hướng không bị lệch do box ban đầu xoay sai.
-  function computeSmartSnap(p, positions, fitSize) {
-    let result = smartSnapOnce(p, positions, fitSize, p[5]);
+  function computeSmartSnap(p, positions, fitSize, priors = []) {
+    let result = smartSnapOnce(p, positions, fitSize, p[5], priors);
     for (let iter = 0; iter < 4 && !result.error; iter++) {
-      const next = smartSnapOnce(result.points, positions, fitSize, p[5]);
+      const next = smartSnapOnce(result.points, positions, fitSize, p[5], priors);
       if (next.error) break;
       const converged = angleDiff(next.points[5], result.points[5]) < 0.2 * RAD &&
         Math.hypot(next.points[0] - result.points[0], next.points[1] - result.points[1]) < 0.01;
@@ -1098,19 +1441,12 @@
     return result;
   }
 
-  function smartSnapOnce(p, positions, fitSize, refYaw) {
-    const plane = estimateGroundPlane(p, positions);
-    let pts = pointsInBox(p, positions, 0.3);
-    // Bỏ điểm mặt đường
-    if (plane) {
-      pts = pts.filter((q) => q[2] - planeZ(plane, q[0], q[1]) > 0.15);
-    } else if (pts.length) {
-      const floor = percentile(pts.map((q) => q[2]), 0.02) + 0.15;
-      pts = pts.filter((q) => q[2] > floor);
-    }
+  function smartSnapOnce(p, positions, fitSize, refYaw, priors) {
+    const { pts, plane } = objectPoints(p, positions, 0.3);
     if (pts.length < 10) return { error: `Chỉ có ${pts.length} điểm trong vùng box (cần ≥ 10).` };
 
-    const yaw = nearestQuarterYaw(pcaYaw(pts), refYaw);
+    const fit = fitRectYaw(pts, priors);
+    const yaw = nearestQuarterYaw(fit.yaw, refYaw);
     const c = Math.cos(yaw), s = Math.sin(yaw);
     let mx = 0, my = 0;
     for (const q of pts) { mx += q[0]; my += q[1]; }
@@ -1147,7 +1483,7 @@
     const bottom = planeZ(ground, out[0], out[1]);
     out[8] = fitSize ? Math.max(0.3, zMax - bottom) : Math.abs(p[8]);
     out[2] = bottom + out[8] / 2;
-    return { points: fitToGround(out, ground, 'snap'), n: pts.length };
+    return { points: fitToGround(out, ground, 'snap'), n: pts.length, conf: fit.conf };
   }
 
   async function smartSnap(ids) {
@@ -1160,13 +1496,16 @@
 
     const fitSize = isChecked('cqt-snap-fit-size');
     const batch = createBatch(fitSize ? 'Smart Snap (fit size)' : 'Smart Snap');
-    const errors = [];
+    const errors = [], unsure = [];
     let lastN = 0;
+    const states = (await getStates(frame)).filter((s) => isCuboid(s) && !s.outside);
     for (const id of list) {
-      const s = await getState(id, frame);
-      if (!isCuboid(s) || s.outside) continue;
-      const r = computeSmartSnap([...s.points], positions, fitSize);
+      const s = states.find((x) => x.clientID === id);
+      if (!s) continue;
+      const priors = yawPriors(s.points, states.filter((x) => x.clientID !== id).map((x) => x.points));
+      const r = computeSmartSnap([...s.points], positions, fitSize, priors);
       if (r.error) { errors.push(`#${id}: ${r.error}`); continue; }
+      if (r.conf < 0.25) unsure.push(id);
       lastN = r.n;
       await batch.edit(s, frame, (st) => { st.points = r.points; });
     }
@@ -1175,12 +1514,13 @@
     setStatus(
       `🧲 Smart Snap ${res.changed} object` + (list.length === 1 ? ` (${lastN} điểm)` : '') +
       (fitSize ? ', đã fit cả size' : ', giữ nguyên LWH') + '.' +
+      (unsure.length ? ` ⚠️ Hướng chưa chắc (cloud thưa/1 mặt, đã dựa thêm vào box xung quanh): #${unsure.join(', #')}.` : '') +
       (errors.length ? ` Lỗi: ${errors.join(' ')}` : '') + editSuffix(res),
-      errors.length ? 'warn' : 'success'
+      errors.length || unsure.length ? 'warn' : 'success'
     );
   }
 
-  // Chỉ xoay yaw theo trục chính của cụm điểm
+  // Chỉ xoay yaw theo cạnh của cụm điểm (L-shape fitting), giữ nguyên vị trí và LWH
   async function alignYawToCloud() {
     const id = requireTarget();
     if (id === null) return;
@@ -1189,12 +1529,12 @@
     if (!s) return;
     const positions = getPointCloudPositions();
     if (!positions) return fail('Không đọc được point cloud.');
-    const pts = pointsInBox(s.points, positions, 0.15);
+    const { pts } = objectPoints(s.points, positions, 0.15);
     if (pts.length < 15) return fail(`Chỉ có ${pts.length} điểm trong box, không đủ để nắn góc.`);
 
-    // Chỉ lật trong mod π (giữ đầu xe), không đổi trục L/W
-    let yaw = pcaYaw(pts);
-    if (angleDiff(yaw, s.points[5]) > Math.PI / 2) yaw = wrapPi(yaw + Math.PI);
+    const others = (await getStates(frame)).filter((x) => x.clientID !== id && isCuboid(x) && !x.outside).map((x) => x.points);
+    const fit = fitRectYaw(pts, yawPriors(s.points, others));
+    const yaw = nearestQuarterYaw(fit.yaw, s.points[5]); // hướng gần góc hiện tại nhất => giữ đầu xe
     const batch = createBatch('Nắn theo cloud');
     await batch.edit(s, frame, (st) => {
       const p = [...st.points];
@@ -1203,7 +1543,8 @@
     });
     const res = await batch.finish();
     await inspectHeading(id, frame);
-    setStatus(`☁️ Đã nắn #${id} theo trục cụm điểm (${(yaw * DEG).toFixed(1)}°, ${pts.length} điểm).` + editSuffix(res), 'success');
+    setStatus(`☁️ Đã nắn #${id} theo cạnh cụm điểm (${(yaw * DEG).toFixed(1)}°, ${pts.length} điểm).` +
+      (fit.conf < 0.25 ? ' ⚠️ Hướng chưa chắc, kiểm tra lại.' : '') + editSuffix(res), fit.conf < 0.25 ? 'warn' : 'success');
   }
 
   // =========================================================================
@@ -1220,6 +1561,7 @@
     setField('cqt-frame-count', 1);
     await fetchLWH(id, frame);
     await matchPresetAndLimits(id, frame);
+    await loadAttrPanel(id, true);
   }
 
   function applyFrameCount() {
@@ -1281,7 +1623,7 @@
     );
   }
 
-  // Kẹp LWH theo limits của class nếu bật "Tự clamp"
+  // Kẹp LWH theo limits của class nếu bật "Ép theo limits" (mặc định tắt: limits chỉ cảnh báo)
   async function clampLWHInputs(id, lwh) {
     if (!isChecked('cqt-limit-clamp-on-apply')) return { ...lwh, note: '' };
     const s = await getState(id, getFrame());
@@ -1463,8 +1805,41 @@
     return Object.keys(getLimits()).find((k) => normalizeClass(k) === normalizeClass(label)) || null;
   }
 
+  function getClassGroups() {
+    const saved = lsGet(LS.classGroups, null);
+    return saved && typeof saved === 'object' ? saved : DEFAULT_CLASS_GROUPS;
+  }
+
+  // Tên nhóm (vehicle / two_wheel / pedestrian...) của một nhãn, null nếu không thuộc nhóm nào
+  function findClassGroup(label) {
+    if (!label) return null;
+    const norm = normalizeClass(label);
+    for (const [group, members] of Object.entries(getClassGroups())) {
+      if (normalizeClass(group) === norm) return group;
+      if (Array.isArray(members) && members.some((m) => normalizeClass(m) === norm)) return group;
+    }
+    return null;
+  }
+
+  // Đoán nhóm cho nhãn lạ theo từ khoá
+  function suggestClassGroup(label) {
+    const found = findClassGroup(label);
+    if (found) return found;
+    const norm = normalizeClass(label);
+    if (/(veh|car|auto|truck|bus|van|suv|sedan|pickup|trailer)/.test(norm)) return 'vehicle';
+    if (/(bike|moto|cycl|two_wheel|scooter)/.test(norm)) return 'two_wheel';
+    if (/(ped|person|people|human|walker|child)/.test(norm)) return 'pedestrian';
+    return null;
+  }
+
+  // Label có thật trong job thuộc nhóm đó (ưu tiên label trùng tên nhóm)
+  function jobLabelForGroup(group) {
+    const labels = jobLabels().filter((l) => findClassGroup(l.name) === group);
+    return labels.find((l) => normalizeClass(l.name) === normalizeClass(group)) || labels[0] || null;
+  }
+
   function getLimitsForLabel(label) {
-    const key = findLimitKey(label);
+    const key = findLimitKey(label) || findLimitKey(findClassGroup(label));
     return key ? getLimits()[key] : null;
   }
 
@@ -1583,167 +1958,6 @@
         await fn(s, f);
       }
     }
-  }
-
-  function formatLimitIssues(rec, lim) {
-    const parts = [];
-    if (rec.maxL > lim.l[1] + 1e-9) parts.push(`L max ${rec.maxL.toFixed(2)} (>${lim.l[1]})`);
-    if (rec.minL < lim.l[0] - 1e-9) parts.push(`L min ${rec.minL.toFixed(2)} (<${lim.l[0]})`);
-    if (rec.maxW > lim.w[1] + 1e-9) parts.push(`W max ${rec.maxW.toFixed(2)} (>${lim.w[1]})`);
-    if (rec.minW < lim.w[0] - 1e-9) parts.push(`W min ${rec.minW.toFixed(2)} (<${lim.w[0]})`);
-    if (rec.maxH > lim.h[1] + 1e-9) parts.push(`H max ${rec.maxH.toFixed(2)} (>${lim.h[1]})`);
-    if (rec.minH < lim.h[0] - 1e-9) parts.push(`H min ${rec.minH.toFixed(2)} (<${lim.h[0]})`);
-    return parts;
-  }
-
-  function updateCandidateSelectAll() {
-    const master = document.querySelector('#cqt-cand-all');
-    const box = document.querySelector('#cqt-limit-candidates');
-    if (!master || !box) return;
-    const boxes = [...box.querySelectorAll('input[data-id]')];
-    const checked = boxes.filter((cb) => cb.checked).length;
-    master.disabled = boxes.length === 0;
-    master.checked = boxes.length > 0 && checked === boxes.length;
-    master.indeterminate = checked > 0 && checked < boxes.length;
-  }
-
-  function renderCandidates() {
-    const box = document.querySelector('#cqt-limit-candidates');
-    if (!box) return;
-    box.innerHTML = '';
-
-    if (!lastClassCandidates.length) {
-      const empty = document.createElement('div');
-      empty.textContent = 'Không có object ngoài limits (hoặc chưa Check class).';
-      empty.style.color = '#8c8c8c';
-      box.appendChild(empty);
-      updateCandidateSelectAll();
-      return;
-    }
-
-    lastClassCandidates.slice(0, 100).forEach((c) => {
-      const label = document.createElement('label');
-      label.className = 'cqt-candidate';
-
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = true;
-      cb.dataset.id = String(c.id);
-      cb.addEventListener('change', updateCandidateSelectAll);
-
-      const span = document.createElement('span');
-      span.textContent = `#${c.id} — ${c.badFrames}/${c.frames} frame — ${c.summary}`;
-
-      label.appendChild(cb);
-      label.appendChild(span);
-      box.appendChild(label);
-    });
-
-    if (lastClassCandidates.length > 100) {
-      const more = document.createElement('div');
-      more.textContent = `... +${lastClassCandidates.length - 100} object khác`;
-      more.style.color = '#8c8c8c';
-      box.appendChild(more);
-    }
-
-    updateCandidateSelectAll();
-  }
-
-  async function clampSelectedCandidates() {
-    const className = String(val('cqt-limit-class') || '').trim();
-    const lim = className ? getLimits()[className] : null;
-    if (!lim) return setStatus('⚠️ Chọn class có limits trước.', 'error');
-
-    if (!lastClassCandidates.length) {
-      return setStatus('⚠️ Chưa có danh sách object ngoài limits. Bấm "Check toàn bộ class" trước.', 'error');
-    }
-    if (!lastClassCheckName || normalizeClass(lastClassCheckName) !== normalizeClass(className)) {
-      return setStatus('⚠️ Danh sách thuộc class khác. Bấm Check lại cho class đang chọn.', 'error');
-    }
-
-    const selected = [...document.querySelectorAll('#cqt-limit-candidates input[data-id]:checked')]
-      .map((cb) => parseInt(cb.dataset.id, 10))
-      .filter((id) => Number.isInteger(id));
-
-    if (!selected.length) return setStatus('⚠️ Tick ít nhất 1 object cần sửa.', 'error');
-
-    const { jobInstance } = getCvatContext();
-    if (!isUsableJob(jobInstance)) return setStatus('⚠️ Chưa kết nối CVAT Job!', 'error');
-
-    const jobStart = Number.isInteger(jobInstance.startFrame) ? jobInstance.startFrame : intVal('cqt-frame-start');
-    const jobStop = Number.isInteger(jobInstance.stopFrame) ? jobInstance.stopFrame : intVal('cqt-frame-end');
-    if (!Number.isInteger(jobStart) || !Number.isInteger(jobStop) || jobStart > jobStop) {
-      return setStatus('⚠️ Không đọc được dải frame của job.', 'error');
-    }
-
-    const keyframesOnly = document.querySelector('#cqt-limit-class-keyframes').checked;
-    if (!keyframesOnly &&
-      !confirm('Sửa mọi frame của các object đã chọn sẽ tạo keyframe ở tất cả frame. Tiếp tục?')) {
-      return;
-    }
-    if (jobStop - jobStart > 5000 &&
-      !confirm(`Sẽ quét ${jobStop - jobStart + 1} frame cho ${selected.length} object. Tiếp tục?`)) {
-      return;
-    }
-
-    const selectedSet = new Set(selected.map(String));
-    const changedIds = new Set();
-    const snap = [];
-    let changedFrames = 0;
-
-    setStatus(`⏳ Sửa ${selected.length} object đã chọn...`);
-
-    for (let f = jobStart; f <= jobStop; f++) {
-      if (f > jobStart && (f - jobStart) % 100 === 0) {
-        setStatus(`⏳ Sửa object: frame ${f}/${jobStop}...`);
-        await sleep(0);
-      }
-
-      const states = await jobInstance.annotations.get(f, true);
-      for (const s of states) {
-        if (!s?.points || s.points.length < 9 || s.outside) continue;
-        if (!selectedSet.has(String(s.clientID))) continue;
-        if (!matchClassLabel(s.label, className)) continue;
-        if (keyframesOnly && !s.keyframe) continue;
-
-        const p = [...s.points];
-        const before = { l: p[6], w: p[7], h: p[8] };
-        const after = clampLWHValues(before.l, before.w, before.h, lim);
-        if (
-          Math.abs(after.l - before.l) < 1e-9 &&
-          Math.abs(after.w - before.w) < 1e-9 &&
-          Math.abs(after.h - before.h) < 1e-9
-        ) continue;
-
-        snap.push(snapshotItem(s, f));
-        const oldBottom = bottomZ(p);
-        p[6] = after.l;
-        p[7] = after.w;
-        p[8] = after.h;
-        p[2] = oldBottom + lowestOffset(p);
-        s.points = p;
-        saveState(s, jobInstance);
-        changedFrames++;
-        changedIds.add(String(s.clientID));
-      }
-    }
-
-    if (!changedFrames) {
-      return setStatus('ℹ️ Các object đã chọn không có frame nào cần sửa (có thể đã trong ngưỡng).', 'success');
-    }
-
-    pushSnapshot('Clamp selected objects', snap);
-    lastClassCandidates = lastClassCandidates.filter((c) => !changedIds.has(String(c.id)));
-    renderCandidates();
-
-    const restored = await refreshCanvas();
-    setStatus(
-      `🔧 Đã sửa ${changedIds.size}/${selected.length} object (${changedFrames} frame). ` +
-      `Còn ${lastClassCandidates.length} object trong danh sách.` +
-      ' Ctrl+S để lưu.' +
-      (restored ? '' : ' ⚠️ Chưa tự về frame cũ.'),
-      'success'
-    );
   }
 
   async function checkClassLimits() {
@@ -1884,6 +2098,163 @@
     const res = await batch.finish();
     if (!res.changed) return fail('Không có box nào được dịch.');
     setStatus(`↔️ Đã dịch ${res.changed} box (${dx}, ${dy}, ${dz}) m tại frame ${frame}.` + editSuffix(res), 'success');
+  }
+
+  // =========================================================================
+  // Sub label (thuộc tính checkbox của label): tick / bỏ tick theo lựa chọn
+  // Lựa chọn lưu theo label: { [label]: { [tên thuộc tính]: 'on' | 'off' | 'keep' } }
+  // =========================================================================
+  let attrPanelLabel = null; // label đang hiển thị trong panel
+  let lastAutoAttrId = null; // object đã tự áp gần nhất (chế độ tự áp)
+
+  function checkboxSpecs(state) {
+    return attrSpecs(state).filter((a) => a.inputType === 'checkbox' && !TRACK_ID_ATTR.test(String(a.name || '').trim()));
+  }
+
+  function getAttrProfiles() {
+    const saved = lsGet(LS.attrProfiles, null);
+    return saved && typeof saved === 'object' ? saved : {};
+  }
+
+  function getAttrProfile(label) {
+    return getAttrProfiles()[label] || {};
+  }
+
+  function saveAttrChoice(label, name, choice) {
+    const all = getAttrProfiles();
+    all[label] = { ...(all[label] || {}), [name]: choice };
+    lsSet(LS.attrProfiles, all);
+  }
+
+  function isTrue(v) {
+    return String(v).toLowerCase() === 'true';
+  }
+
+  // Vẽ danh sách sub label của object
+  async function loadAttrPanel(id = resolveTargetId(), quiet = false) {
+    const box = $('cqt-attr-list');
+    if (!box) return;
+    if (!Number.isInteger(id)) return quiet ? null : fail('Chọn object trước!');
+    const s = quiet ? await getState(id, getFrame()) : await requireCuboidAtFrame(id);
+    if (!isCuboid(s)) return;
+    const label = labelName(s);
+    const specs = checkboxSpecs(s);
+    attrPanelLabel = label;
+    box.innerHTML = '';
+    const title = $('cqt-attr-label');
+    if (title) title.textContent = label ? `[${label}]` : '';
+    if (!specs.length) {
+      box.textContent = `Label "${label}" không có sub label dạng checkbox.`;
+      return;
+    }
+    const profile = getAttrProfile(label);
+    for (const spec of specs) {
+      const row = document.createElement('div');
+      row.className = 'cqt-row cqt-attr-row';
+      const name = document.createElement('span');
+      name.className = 'cqt-label';
+      name.style.flex = '1';
+      const now = isTrue(attrValue(s, spec));
+      name.textContent = `${spec.name} ${now ? '☑' : '☐'}`;
+      name.title = `Hiện tại ở frame ${getFrame()}: ${now ? 'đang tick' : 'chưa tick'}${spec.mutable ? ' (thay đổi theo frame)' : ''}`;
+      const select = document.createElement('select');
+      select.className = 'cqt-input cqt-attr-choice';
+      select.style.width = '110px';
+      select.dataset.attr = spec.name;
+      for (const [v, text] of [['keep', 'Giữ nguyên'], ['on', '✔ Tick'], ['off', '✖ Bỏ tick']]) select.add(new Option(text, v));
+      select.value = profile[spec.name] || 'keep';
+      select.addEventListener('change', () => saveAttrChoice(label, spec.name, select.value));
+      row.append(name, select);
+      box.appendChild(row);
+    }
+  }
+
+  function setAllAttrChoices(choice) {
+    if (!attrPanelLabel) return fail('Bấm "Nạp" để hiện sub label trước.');
+    document.querySelectorAll('.cqt-attr-choice').forEach((sel) => {
+      sel.value = choice;
+      saveAttrChoice(attrPanelLabel, sel.dataset.attr, choice);
+    });
+  }
+
+  // Các frame cần sửa cho 1 object theo phạm vi
+  async function attrFramesFor(id, scope) {
+    const f = getFrame();
+    if (scope === 'frame') return Number.isInteger(f) ? [f] : [];
+    let from, to;
+    if (scope === 'range') {
+      from = intVal('cqt-frame-start');
+      to = intVal('cqt-frame-end');
+      if (!Number.isInteger(from) || !Number.isInteger(to) || from > to) return null;
+    } else {
+      const b = jobBounds();
+      if (!b) return [];
+      from = b.start;
+      to = b.stop;
+    }
+    const list = await collectTrack(id, from, to);
+    // Track: sửa mọi keyframe (thuộc tính đổi theo frame giữ giá trị tới keyframe kế tiếp)
+    const keys = list.filter((x) => isKey(x.state)).map((x) => x.frame);
+    return keys.length ? keys : list.slice(0, 1).map((x) => x.frame);
+  }
+
+  async function applyAttrProfile(ids = selectedOrTarget(), { quiet = false } = {}) {
+    if (!ids.length) return fail('Chọn object trước!');
+    const scope = val('cqt-attr-scope') || 'track';
+    const batch = createBatch('Sub label');
+    let objects = 0, noProfile = 0;
+    for (const id of ids) {
+      const frames = await attrFramesFor(id, scope);
+      if (frames === null) return fail('Dải frame không hợp lệ (Start <= End)!');
+      let touched = false;
+      for (const f of frames) {
+        const s = await getState(id, f);
+        if (!isCuboid(s) || s.outside) continue;
+        const profile = getAttrProfile(labelName(s));
+        const wanted = checkboxSpecs(s).filter((spec) => profile[spec.name] === 'on' || profile[spec.name] === 'off');
+        if (!wanted.length) { noProfile++; break; }
+        const ok = await batch.edit(s, f, (st) => {
+          let changed = false;
+          for (const spec of wanted) {
+            const want = profile[spec.name] === 'on';
+            if (isTrue(attrValue(st, spec)) === want) continue;
+            setAttr(st, spec, want ? 'true' : 'false');
+            changed = true;
+          }
+          return changed;
+        });
+        touched = touched || ok;
+      }
+      if (touched) objects++;
+    }
+    const res = await batch.finish();
+    if (attrPanelLabel) await loadAttrPanel(resolveTargetId(), true);
+    if (quiet && !res.changed) return;
+    if (!res.changed) {
+      return setStatus(noProfile === ids.length
+        ? '⚠️ Chưa chọn sub label nào để tick/bỏ tick cho label này.'
+        : 'ℹ️ Sub label đã đúng như lựa chọn.', noProfile === ids.length ? 'warn' : 'success');
+    }
+    const where = { frame: `frame ${getFrame()}`, track: 'toàn track', range: 'dải Start–End' }[scope];
+    setStatus(`🏷️ Đã cập nhật sub label cho ${objects} object (${res.changed} lần sửa, ${where}).` +
+      (noProfile ? ` Bỏ qua ${noProfile} object vì label của nó chưa có lựa chọn sub label.` : '') + editSuffix(res), 'success');
+  }
+
+  // Chế độ tự áp: gọi mỗi giây từ vòng init, chỉ chạy khi object được chọn thay đổi
+  let autoAttrBusy = false;
+  async function autoAttrTick() {
+    if (autoAttrBusy || !isChecked('cqt-attr-auto')) return;
+    const id = activeId();
+    if (id === null || id === lastAutoAttrId) return;
+    lastAutoAttrId = id;
+    autoAttrBusy = true;
+    try {
+      await applyAttrProfile([id], { quiet: true });
+    } catch (e) {
+      console.warn(LOG, 'Tự áp sub label lỗi:', e);
+    } finally {
+      autoAttrBusy = false;
+    }
   }
 
   // =========================================================================
@@ -2055,11 +2426,15 @@
   // Frame | Item ID | Track ID | Class | Loại kiểm tra | Mô tả | Giá trị | Ngưỡng / Chuẩn | Track liên quan
   // =========================================================================
   const QA_TYPES = {
+    missingTrack: 'Thiếu track_id',
+    duplicateTrack: 'Trùng track_id',
+    unknownClass: 'Class không nhận dạng',
     scale: 'Scale không đồng bộ',
     yaw: 'Đổi hướng đột ngột',
     overlap: 'Chồng lấn',
     dist: 'Quá xa',
     limits: 'Ngoài limits',
+    ground: 'Chưa chạm đất',
   };
 
   let lastQA = null; // { rows, data, opts, range }
@@ -2076,6 +2451,9 @@
         o[key] = el.checked;
       }
     };
+    read('cqt-qa-check-missing-track', 'missingTrack');
+    read('cqt-qa-check-duplicate-track', 'duplicateTrack');
+    read('cqt-qa-check-unknown-class', 'unknownClass');
     read('cqt-qa-check-scale', 'scale');
     read('cqt-qa-scale-tol', 'scaleTol', true);
     read('cqt-qa-check-yaw', 'yaw');
@@ -2085,6 +2463,9 @@
     read('cqt-qa-check-dist', 'dist');
     read('cqt-qa-dist-threshold', 'distThresh', true);
     read('cqt-qa-check-limits', 'limits');
+    read('cqt-qa-check-ground', 'ground');
+    read('cqt-qa-ground-tol', 'groundTol', true);
+    read('cqt-qa-ground-all', 'groundAll');
     read('cqt-qa-whole-job', 'wholeJob');
     lsSet(LS.qa, o);
     return o;
@@ -2098,6 +2479,9 @@
       if (typeof v === 'boolean') el.checked = v;
       else el.value = v;
     };
+    set('cqt-qa-check-missing-track', o.missingTrack);
+    set('cqt-qa-check-duplicate-track', o.duplicateTrack);
+    set('cqt-qa-check-unknown-class', o.unknownClass);
     set('cqt-qa-check-scale', o.scale);
     set('cqt-qa-scale-tol', o.scaleTol);
     set('cqt-qa-check-yaw', o.yaw);
@@ -2107,6 +2491,9 @@
     set('cqt-qa-check-dist', o.dist);
     set('cqt-qa-dist-threshold', o.distThresh);
     set('cqt-qa-check-limits', o.limits);
+    set('cqt-qa-check-ground', o.ground);
+    set('cqt-qa-ground-tol', o.groundTol);
+    set('cqt-qa-ground-all', o.groundAll);
     set('cqt-qa-whole-job', o.wholeJob);
   }
 
@@ -2132,14 +2519,15 @@
       for (const s of await getStates(f)) {
         if (!isCuboid(s) || s.outside) continue;
         if (onlyId !== null && s.clientID !== onlyId) continue;
+        const tid = trackIdOf(s);
         let rec = tracks.get(s.clientID);
         if (!rec) {
-          rec = { id: s.clientID, label: labelName(s), objectType: s.objectType, frames: [] };
+          rec = { id: s.clientID, label: labelName(s), objectType: s.objectType, hasTrackAttr: !!tid.spec, frames: [] };
           tracks.set(s.clientID, rec);
         }
-        const item = { frame: f, points: [...s.points], keyframe: isKey(s) };
+        const item = { frame: f, points: [...s.points], keyframe: isKey(s), tidKey: tid.key, tid: tid.value };
         rec.frames.push(item);
-        list.push({ id: s.clientID, label: rec.label, points: item.points });
+        list.push({ id: s.clientID, label: rec.label, points: item.points, tidKey: tid.key, tid: tid.value });
       }
       frames.set(f, list);
     }
@@ -2167,6 +2555,27 @@
       rows.push({ frame, itemId: '', trackId: rec.id, cls: rec.label, type, desc, value, threshold, related });
 
     for (const rec of data.tracks.values()) {
+      // Thiếu track_id: shape không có thuộc tính track_id, hoặc thuộc tính track_id để trống
+      if (opts.missingTrack) {
+        for (const x of rec.frames) {
+          if (x.tidKey != null) continue;
+          row(x.frame, rec, QA_TYPES.missingTrack,
+            rec.hasTrackAttr
+              ? `Thuộc tính track_id đang trống (${rec.objectType === 'track' ? 'track' : 'shape'})`
+              : 'Cuboid là shape, không thuộc track nào và label không có thuộc tính track_id',
+            'Thiếu track_id', 'Phải có track_id hợp lệ');
+        }
+      }
+
+      // Nhãn không thuộc nhóm nào trong class_groups
+      if (opts.unknownClass && !findClassGroup(rec.label)) {
+        const groups = Object.keys(getClassGroups()).join(', ');
+        for (const x of rec.frames) {
+          row(x.frame, rec, QA_TYPES.unknownClass,
+            `Tên nhãn '${rec.label}' không nằm trong danh mục các nhóm của class_groups`, rec.label, groups);
+        }
+      }
+
       // Scale không đồng bộ: so với size chuẩn (median) của track
       if (opts.scale && rec.frames.length > 1) {
         const m = trackMedianLWH(rec);
@@ -2235,6 +2644,27 @@
       }
     }
 
+    // Trùng track_id: 2 cuboid trở lên cùng track_id trong 1 frame
+    if (opts.duplicateTrack) {
+      for (const [f, list] of data.frames) {
+        const byKey = new Map();
+        for (const it of list) {
+          if (it.tidKey == null) continue;
+          if (!byKey.has(it.tidKey)) byKey.set(it.tidKey, []);
+          byKey.get(it.tidKey).push(it);
+        }
+        for (const boxes of byKey.values()) {
+          if (boxes.length < 2) continue;
+          for (const self of boxes) {
+            const other = boxes.find((b) => b !== self);
+            row(f, { id: self.id, label: self.label }, QA_TYPES.duplicateTrack,
+              `Cùng track_id ${self.tid} xuất hiện ${boxes.length} cuboid trong frame ${f} (trùng với #${other.id})`,
+              `${boxes.length} cuboid`, '1 cuboid / frame', other.id);
+          }
+        }
+      }
+    }
+
     const order = Object.values(QA_TYPES);
     rows.sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type) || a.trackId - b.trackId || a.frame - b.frame);
     return rows;
@@ -2246,6 +2676,59 @@
     for (const r of rows) r.itemId = names.get(r.frame) || '';
   }
 
+  // Point cloud chỉ có cho frame đang hiển thị => chuyển frame rồi chờ CVAT nạp cloud mới
+  async function cloudAtFrame(f, prev) {
+    if (getFrame() === f && prev) return prev;
+    if (!(await goToFrame(f))) return null;
+    for (let t = 0; t < 50; t++) {
+      const pos = getPointCloudPositions();
+      if (pos && pos !== prev) return pos;
+      await sleep(100);
+    }
+    return null;
+  }
+
+  // Chưa chạm đất: so góc thấp nhất của box với mặt đất cục bộ đo từ cloud (estimateGroundPlane).
+  // Mỗi dòng lưu kèm plane để auto-fix hạ/nâng đúng frame đó.
+  async function scanGroundRows(data, opts) {
+    const byFrame = new Map(); // frame -> [{ rec, x }]
+    for (const rec of data.tracks.values()) {
+      for (const x of rec.frames) {
+        if (!opts.groundAll && !x.keyframe) continue;
+        if (!byFrame.has(x.frame)) byFrame.set(x.frame, []);
+        byFrame.get(x.frame).push({ rec, x });
+      }
+    }
+    const original = getFrame();
+    // Frame đang mở trước (khỏi chờ nạp), còn lại theo thứ tự
+    const frames = [...byFrame.keys()].sort((a, b) => (a === original ? -1 : b === original ? 1 : a - b));
+    const rows = [];
+    let prev = frames[0] === original ? getPointCloudPositions() : null;
+    let noCloud = 0, noGround = 0, checked = 0;
+    for (let i = 0; i < frames.length; i++) {
+      const f = frames[i];
+      setStatus(`⏳ QA mặt đất: frame ${f} (${i + 1}/${frames.length})...`);
+      const pos = await cloudAtFrame(f, prev);
+      if (!pos) { noCloud++; continue; }
+      prev = pos;
+      for (const { rec, x } of byFrame.get(f)) {
+        const plane = estimateGroundPlane(x.points, pos);
+        if (!plane) { noGround++; continue; }
+        checked++;
+        const gap = groundGap(x.points, plane);
+        if (Math.abs(gap) <= opts.groundTol) continue;
+        rows.push({
+          frame: f, itemId: '', trackId: rec.id, cls: rec.label, type: QA_TYPES.ground,
+          desc: gap > 0 ? `Lơ lửng ${gap.toFixed(3)} m trên mặt đất` : `Lún ${(-gap).toFixed(3)} m xuống mặt đất`,
+          value: gap.toFixed(3), threshold: `|lệch| ≤ ${opts.groundTol} m`, related: '',
+          plane, keyframe: x.keyframe,
+        });
+      }
+    }
+    if (Number.isInteger(original) && getFrame() !== original) await goToFrame(original);
+    return { rows, stats: { checked, noCloud, noGround, frames: frames.length } };
+  }
+
   async function scanQA() {
     const opts = readQAOptionsFromUI();
     const range = qaRange(opts);
@@ -2254,12 +2737,20 @@
     const data = await scanJobData(range.from, range.to);
     if (!data.tracks.size) return fail('Không có cuboid nào trong dải.');
     const rows = runQAChecks(data, opts);
+    let groundNote = '';
+    if (opts.ground) {
+      const g = await scanGroundRows(data, opts);
+      rows.push(...g.rows);
+      groundNote = ` Mặt đất: đo ${g.stats.checked} box / ${g.stats.frames} frame` +
+        (g.stats.noCloud ? `, ${g.stats.noCloud} frame không đọc được cloud` : '') +
+        (g.stats.noGround ? `, ${g.stats.noGround} box thiếu điểm đất` : '') + '.';
+    }
     await fillItemIds(rows);
     lastQA = { rows, data, opts, range };
     renderQAResult();
     const tracks = new Set(rows.map((r) => r.trackId)).size;
     setStatus(
-      `🔎 QA ${range.from}–${range.to}: ${data.tracks.size} object, ${rows.length} lỗi ở ${tracks} object.`,
+      `🔎 QA ${range.from}–${range.to}: ${data.tracks.size} object, ${rows.length} lỗi ở ${tracks} object.` + groundNote,
       rows.length ? 'warn' : 'success'
     );
     return lastQA;
@@ -2343,7 +2834,8 @@
 
   function planSizeFix(rec, opts) {
     const m = trackMedianLWH(rec);
-    const lim = opts.limits ? getLimitsForLabel(rec.label) : null;
+    // Chỉ kẹp limits khi bật "Ép theo limits"; tắt thì chỉ đồng bộ về median của track
+    const lim = getSettings().enforceLimits ? getLimitsForLabel(rec.label) : null;
     const t = lim ? clampLWH(m.l, m.w, m.h, lim) : m;
     const clamped = !sameLWH([0, 0, 0, 0, 0, 0, m.l, m.w, m.h], t.l, t.w, t.h, 1e-9);
     const frames = rec.frames.filter((x) => x.keyframe && !sameLWH(x.points, t.l, t.w, t.h, 1e-4)).map((x) => x.frame);
@@ -2443,49 +2935,234 @@
     return ops;
   }
 
-  // Quá xa: đặt outside cho các đoạn frame vượt ngưỡng
-  function planFarFix(rec, opts) {
-    const far = (x) => Math.hypot(x.points[0], x.points[1], x.points[2]) > opts.distThresh;
-    const fr = rec.frames;
+  // Gom các frame thoả điều kiện thành các đoạn liên tiếp (theo chỉ số trong rec.frames)
+  function frameSegments(fr, pick) {
     const segments = [];
     for (let i = 0; i < fr.length; i++) {
-      if (!far(fr[i])) continue;
+      if (!pick(fr[i])) continue;
       const last = segments[segments.length - 1];
       if (last && last.endIdx === i - 1 && fr[i].frame === fr[i - 1].frame + 1) last.endIdx = i;
       else segments.push({ startIdx: i, endIdx: i });
     }
+    return segments;
+  }
+
+  function segmentsText(fr, segments) {
+    return segments.map((s) => `f${fr[s.startIdx].frame}–f${fr[s.endIdx].frame}`).join(', ');
+  }
+
+  // Ẩn track đúng trong các đoạn (không xoá gì): chốt keyframe ngay sau đoạn rồi đặt outside từ đầu đoạn
+  async function applyOutsideSegments(batch, rec, segments) {
+    const fr = rec.frames;
+    for (const seg of segments) {
+      const a = fr[seg.startIdx].frame;
+      const b = fr[seg.endIdx].frame;
+      const after = fr[seg.endIdx + 1];
+      if (after && after.frame === b + 1) {
+        const s = await getState(rec.id, after.frame);
+        if (s && !s.outside && !s.keyframe) await batch.edit(s, after.frame, (st) => { st.keyframe = true; });
+      }
+      for (let k = seg.startIdx; k <= seg.endIdx; k++) {
+        const x = fr[k];
+        if (x.frame !== a && !x.keyframe) continue;
+        const s = await getState(rec.id, x.frame);
+        if (s && !s.outside) await batch.edit(s, x.frame, (st) => { st.outside = true; });
+      }
+    }
+  }
+
+  // Quá xa: đặt outside cho các đoạn frame vượt ngưỡng
+  function planFarFix(rec, opts) {
+    const fr = rec.frames;
+    const segments = frameSegments(fr, (x) => Math.hypot(x.points[0], x.points[1], x.points[2]) > opts.distThresh);
     if (!segments.length) return null;
-    const desc = segments.map((s) => `f${fr[s.startIdx].frame}–f${fr[s.endIdx].frame}`).join(', ');
+    const desc = segmentsText(fr, segments);
     if (rec.objectType !== 'track') {
       return {
         type: 'far', trackId: rec.id, auto: false, frame: fr[segments[0].startIdx].frame,
         title: `#${rec.id} [${rec.label}] · Quá xa > ${opts.distThresh}m (shape)`,
-        detail: `Shape không có outside, cần xoá/kiểm tra tay: ${desc}`,
+        detail: `Shape không có outside, cần kiểm tra tay: ${desc}`,
       };
     }
     return {
       type: 'far', trackId: rec.id, auto: true, checked: false,
       title: `#${rec.id} [${rec.label}] · Đặt outside ${segments.length} đoạn quá xa > ${opts.distThresh}m`,
       detail: `Ẩn track ở: ${desc} (mặc định không chọn — xem lại trước)`,
-      apply: async (batch) => {
-        for (const seg of segments) {
-          const a = fr[seg.startIdx].frame;
-          const b = fr[seg.endIdx].frame;
-          const after = fr[seg.endIdx + 1];
-          // Giữ phần track sau đoạn xa: chốt keyframe ngay sau đoạn trước khi đặt outside
-          if (after && after.frame === b + 1) {
-            const s = await getState(rec.id, after.frame);
-            if (s && !s.outside && !s.keyframe) await batch.edit(s, after.frame, (st) => { st.keyframe = true; });
-          }
-          for (let k = seg.startIdx; k <= seg.endIdx; k++) {
-            const x = fr[k];
-            if (x.frame !== a && !x.keyframe) continue;
-            const s = await getState(rec.id, x.frame);
-            if (s && !s.outside) await batch.edit(s, x.frame, (st) => { st.outside = true; });
-          }
-        }
-      },
+      apply: (batch) => applyOutsideSegments(batch, rec, segments),
     };
+  }
+
+  // Gán thuộc tính track_id cho các frame của object (track: mọi keyframe; shape: chính box đó)
+  async function applyTrackIdAttr(batch, rec, frames, value) {
+    for (const f of frames) {
+      const s = await getState(rec.id, f);
+      if (!s) continue;
+      const spec = findAttrSpec(s, TRACK_ID_ATTR);
+      if (!spec) continue;
+      await batch.edit(s, f, (st) => {
+        if (String(attrValue(st, spec) ?? '') === String(value)) return false;
+        setAttr(st, spec, value);
+        return true;
+      });
+    }
+  }
+
+  function keyFrames(rec) {
+    const k = rec.frames.filter((x) => x.keyframe).map((x) => x.frame);
+    return k.length ? k : [rec.frames[0].frame];
+  }
+
+  function nextNumericTrackId(data) {
+    let max = 0;
+    for (const rec of data.tracks.values()) {
+      for (const x of rec.frames) if (Number.isInteger(x.tid) && x.tidKey?.startsWith('a:')) max = Math.max(max, x.tid);
+    }
+    return max + 1;
+  }
+
+  // Thiếu track_id: nếu label có thuộc tính track_id thì nối với box cùng nhóm class gần nhất ở frame kề (≤ 2.5m),
+  // không có thì cấp ID mới. Không có thuộc tính track_id => chỉ báo sửa tay (không đổi được shape thành track).
+  function planMissingTrackFix(data, rows, idPool) {
+    const ops = [];
+    const ids = [...new Set(rows.filter((r) => r.type === QA_TYPES.missingTrack).map((r) => r.trackId))];
+    const missing = [];
+    for (const id of ids) {
+      const rec = data.tracks.get(id);
+      if (!rec.hasTrackAttr) {
+        ops.push({
+          type: 'missingTrack', trackId: id, auto: false, frame: rec.frames[0].frame,
+          title: `#${id} [${rec.label}] · Shape không thuộc track (${rec.frames.length} frame)`,
+          detail: 'Label không có thuộc tính track_id: cần tạo track trong CVAT hoặc thêm thuộc tính track_id vào label.',
+        });
+      } else {
+        missing.push(rec);
+      }
+    }
+    // Nối theo thứ tự frame để box sau dùng được ID vừa gán cho box trước
+    missing.sort((a, b) => a.frames[0].frame - b.frames[0].frame);
+    const assigned = new Map(); // clientID -> track_id
+    // track_id đang có trong từng frame (kể cả ID vừa gán) để không tạo trùng mới
+    const usedIn = (f) => new Set((data.frames.get(f) || [])
+      .map((it) => (assigned.has(it.id) ? assigned.get(it.id) : (it.tidKey?.startsWith('a:') ? it.tid : null)))
+      .filter((v) => v !== null));
+    for (const rec of missing) {
+      const first = rec.frames[0];
+      const group = findClassGroup(rec.label) || normalizeClass(rec.label);
+      const taken = new Set(rec.frames.flatMap((x) => [...usedIn(x.frame)]));
+      let best = null;
+      for (const f of [first.frame - 1, first.frame + 1]) {
+        for (const it of data.frames.get(f) || []) {
+          if (it.id === rec.id) continue;
+          if ((findClassGroup(it.label) || normalizeClass(it.label)) !== group) continue;
+          const tid = assigned.has(it.id) ? assigned.get(it.id) : (it.tidKey?.startsWith('a:') ? it.tid : null);
+          if (tid === null || taken.has(tid)) continue;
+          const d = Math.hypot(it.points[0] - first.points[0], it.points[1] - first.points[1]);
+          if (d <= 2.5 && (!best || d < best.d)) best = { d, tid, from: it.id, f };
+        }
+      }
+      const value = best ? best.tid : idPool.next++;
+      assigned.set(rec.id, value);
+      const frames = rec.objectType === 'track' ? keyFrames(rec) : rec.frames.map((x) => x.frame);
+      ops.push({
+        type: 'missingTrack', trackId: rec.id, auto: true, checked: true, frame: first.frame,
+        title: `#${rec.id} [${rec.label}] · Gán track_id = ${value}`,
+        detail: best
+          ? `Nối với #${best.from} ở f${best.f} (cách ${best.d.toFixed(2)}m): ${framesText(frames)}`
+          : `Không có box kề phù hợp, cấp ID mới: ${framesText(frames)}`,
+        apply: (batch) => applyTrackIdAttr(batch, rec, frames, value),
+      });
+    }
+    return ops;
+  }
+
+  // Trùng track_id trong 1 frame:
+  //  - 2 box gần như trùng nhau (box ma): ẩn box có ID lớn hơn đúng trong các frame trùng (outside, không xoá)
+  //  - 2 box ở vị trí khác nhau: cấp track_id mới cho object có ID lớn hơn (nếu có thuộc tính track_id)
+  function planDuplicateTrackFix(data, rows, idPool) {
+    const ops = [];
+    const pairs = new Map();
+    for (const r of rows) {
+      if (r.type !== QA_TYPES.duplicateTrack) continue;
+      const a = Math.min(r.trackId, r.related), b = Math.max(r.trackId, r.related);
+      const key = `${a}-${b}`;
+      if (!pairs.has(key)) pairs.set(key, { keep: a, drop: b, frames: new Set() });
+      pairs.get(key).frames.add(r.frame);
+    }
+    for (const p of pairs.values()) {
+      const keep = data.tracks.get(p.keep), drop = data.tracks.get(p.drop);
+      const both = drop.frames.filter((x) => p.frames.has(x.frame));
+      let ghost = 0;
+      for (const x of both) {
+        const k = keep.frames.find((y) => y.frame === x.frame);
+        const ov = k && bevOverlap(k.points, x.points);
+        if (k && (Math.hypot(k.points[0] - x.points[0], k.points[1] - x.points[1]) < 0.4 || (ov && ov.iou > 0.4))) ghost++;
+      }
+      const frames = [...p.frames].sort((x, y) => x - y);
+      const tidText = drop.frames.find((x) => p.frames.has(x.frame))?.tid;
+      if (ghost >= both.length / 2) {
+        if (drop.objectType !== 'track') {
+          ops.push({
+            type: 'duplicateTrack', trackId: p.drop, auto: false, frame: frames[0],
+            title: `#${p.drop} · Box ma trùng #${p.keep} (shape)`,
+            detail: `Shape không có outside, cần kiểm tra tay: ${framesText(frames)}`,
+          });
+          continue;
+        }
+        const segments = frameSegments(drop.frames, (x) => p.frames.has(x.frame));
+        ops.push({
+          type: 'duplicateTrack', trackId: p.drop, auto: true, checked: true, frame: frames[0],
+          title: `#${p.drop} · Ẩn box ma trùng #${p.keep} (track_id ${tidText})`,
+          detail: `Đặt outside đúng các đoạn trùng: ${segmentsText(drop.frames, segments)}`,
+          apply: (batch) => applyOutsideSegments(batch, drop, segments),
+        });
+      } else if (drop.hasTrackAttr) {
+        const value = idPool.next++;
+        const target = drop.objectType === 'track' ? keyFrames(drop) : drop.frames.map((x) => x.frame);
+        ops.push({
+          type: 'duplicateTrack', trackId: p.drop, auto: true, checked: true, frame: frames[0],
+          title: `#${p.drop} · Tách khỏi #${p.keep}: track_id ${tidText} → ${value}`,
+          detail: `Hai box ở vị trí khác nhau tại ${framesText(frames)}; gán track_id mới cho #${p.drop}.`,
+          apply: (batch) => applyTrackIdAttr(batch, drop, target, value),
+        });
+      } else {
+        ops.push({
+          type: 'duplicateTrack', trackId: p.drop, auto: false, frame: frames[0],
+          title: `#${p.drop} ↔ #${p.keep} · Trùng track_id ${tidText}`,
+          detail: `Cần sửa tay: ${framesText(frames)}`,
+        });
+      }
+    }
+    return ops;
+  }
+
+  // Nhãn lạ: đổi sang label có thật trong job thuộc nhóm đoán được (không đổi tên label)
+  function planUnknownClassFix(data, rows) {
+    const ops = [];
+    const ids = new Set(rows.filter((r) => r.type === QA_TYPES.unknownClass).map((r) => r.trackId));
+    for (const id of ids) {
+      const rec = data.tracks.get(id);
+      const group = suggestClassGroup(rec.label);
+      const target = group && jobLabelForGroup(group);
+      if (!target) {
+        ops.push({
+          type: 'unknownClass', trackId: id, auto: false, frame: rec.frames[0].frame,
+          title: `#${id} [${rec.label}] · Nhãn không thuộc class_groups`,
+          detail: group ? `Đoán là nhóm "${group}" nhưng job không có label nào thuộc nhóm này.` : 'Không đoán được nhóm, cần sửa tay.',
+        });
+        continue;
+      }
+      const f0 = rec.frames[0].frame;
+      ops.push({
+        type: 'unknownClass', trackId: id, auto: true, checked: false, frame: f0,
+        title: `#${id} [${rec.label}] → đổi sang label "${target.name}" (nhóm ${group})`,
+        detail: 'Đổi label của cả object (CVAT có thể đặt lại thuộc tính về mặc định). Mặc định không chọn — xem lại trước.',
+        apply: async (batch) => {
+          const s = await getState(id, f0);
+          if (s) await batch.edit(s, f0, (st) => { st.label = target; });
+        },
+      });
+    }
+    return ops;
   }
 
   function planOverlapNotes(rows) {
@@ -2505,7 +3182,52 @@
     }));
   }
 
-  // types: tập loại cần đề xuất ('size', 'yaw', 'far', 'overlap')
+  // Chưa chạm đất: hạ/nâng keyframe về mặt đất đã đo (giữ nghiêng). Frame nội suy thì báo sửa tay
+  // (sửa trực tiếp sẽ tạo keyframe mới): sửa keyframe kề rồi quét lại.
+  function planGroundFix(rows) {
+    const ops = [];
+    const byTrack = new Map();
+    for (const r of rows) {
+      if (r.type !== QA_TYPES.ground) continue;
+      if (!byTrack.has(r.trackId)) byTrack.set(r.trackId, []);
+      byTrack.get(r.trackId).push(r);
+    }
+    for (const [id, list] of byTrack) {
+      const keys = list.filter((r) => r.keyframe);
+      const inter = list.filter((r) => !r.keyframe);
+      const cls = list[0].cls;
+      if (keys.length) {
+        const gaps = keys.map((r) => +r.value);
+        ops.push({
+          type: 'ground', trackId: id, auto: true, checked: true,
+          title: `#${id} [${cls}] · Đặt chạm đất ${keys.length} keyframe`,
+          detail: `Lệch ${fmtSigned(Math.min(...gaps), 3)} → ${fmtSigned(Math.max(...gaps), 3)} m, giữ nghiêng: ${framesText(keys.map((r) => r.frame))}`,
+          apply: async (batch) => {
+            for (const r of keys) {
+              const s = await getState(id, r.frame);
+              if (!isCuboid(s) || s.outside) continue;
+              await batch.edit(s, r.frame, (st) => {
+                const after = fitToGround(st.points, r.plane, 'snap');
+                if (Math.abs(after[2] - st.points[2]) < 1e-4) return false;
+                st.points = after;
+                return true;
+              });
+            }
+          },
+        });
+      }
+      if (inter.length) {
+        ops.push({
+          type: 'ground', trackId: id, auto: false, frame: inter[0].frame,
+          title: `#${id} [${cls}] · ${inter.length} frame nội suy chưa chạm đất`,
+          detail: `Sửa keyframe gần đó hoặc thêm keyframe: ${framesText(inter.map((r) => r.frame))}`,
+        });
+      }
+    }
+    return ops;
+  }
+
+  // types: tập loại cần đề xuất ('size', 'yaw', 'ground', 'far', 'overlap')
   function planFixes(qa, types) {
     const { rows, data, opts } = qa;
     const flagged = (type) => new Set(rows.filter((r) => r.type === type).map((r) => r.trackId));
@@ -2516,12 +3238,21 @@
       const frame = rows.find((r) => r.trackId === id)?.frame;
       ops.push({ type, trackId: id, auto: false, frame, title: `#${id} [${rec.label}] · ${text}`, detail: 'Không tự sửa được, cần kiểm tra tay.' });
     };
+    const idPool = { next: nextNumericTrackId(data) }; // ID mới dùng chung, không cấp trùng
+    if (types.has('missingTrack')) ops.push(...planMissingTrackFix(data, rows, idPool));
+    if (types.has('duplicateTrack')) ops.push(...planDuplicateTrackFix(data, rows, idPool));
+    if (types.has('unknownClass')) ops.push(...planUnknownClassFix(data, rows));
     if (types.has('size')) {
-      const ids = new Set([...flagged(QA_TYPES.scale), ...flagged(QA_TYPES.limits)]);
+      // Track chỉ ngoài limits (không lệch scale) có thể hợp lệ (vd. người đang cúi) => chỉ đề xuất khi bật ép limits, mặc định không tick
+      const scaleIds = flagged(QA_TYPES.scale);
+      const enforce = getSettings().enforceLimits;
+      const ids = new Set([...scaleIds, ...(enforce ? flagged(QA_TYPES.limits) : [])]);
       for (const id of ids) {
         const op = planSizeFix(data.tracks.get(id), opts);
-        if (op) ops.push(op);
-        else manualNote('size', id, 'Size lệch nhưng mọi keyframe đã đúng chuẩn');
+        if (op) {
+          if (!scaleIds.has(id)) op.checked = false;
+          ops.push(op);
+        } else if (scaleIds.has(id)) manualNote('size', id, 'Size lệch nhưng mọi keyframe đã đúng chuẩn');
       }
     }
     if (types.has('yaw')) {
@@ -2531,6 +3262,7 @@
         else manualNote('yaw', id, 'Đổi hướng đột ngột');
       }
     }
+    if (types.has('ground')) ops.push(...planGroundFix(rows));
     if (types.has('far')) {
       for (const id of flagged(QA_TYPES.dist)) {
         const op = planFarFix(data.tracks.get(id), opts);
@@ -2544,7 +3276,7 @@
   async function previewAutoFix() {
     const qa = lastQA || await scanQA();
     if (!qa) return;
-    const ops = planFixes(qa, new Set(['size', 'yaw', 'far', 'overlap']));
+    const ops = planFixes(qa, new Set(['missingTrack', 'duplicateTrack', 'unknownClass', 'size', 'yaw', 'ground', 'far', 'overlap']));
     if (!ops.length) return setStatus('✅ Không có lỗi nào cần sửa.', 'success');
     openFixPreview('Xem trước auto-fix QA', ops);
   }
@@ -2660,8 +3392,9 @@
 
   async function applyFixes(title, ops) {
     const batch = createBatch(title);
-    // Size trước, rồi yaw, rồi outside (outside ẩn frame nên làm cuối)
-    const order = { size: 0, yaw: 1, far: 2 };
+    // Đổi label trước (có thể đặt lại thuộc tính), rồi track_id, size, yaw, chạm đất (sau size/yaw vì 2 cái đó đổi góc đáy);
+    // outside làm cuối vì ẩn frame
+    const order = { unknownClass: 0, missingTrack: 1, size: 2, yaw: 3, ground: 4, duplicateTrack: 5, far: 6 };
     const sorted = [...ops].sort((a, b) => order[a.type] - order[b.type]);
     for (let i = 0; i < sorted.length; i++) {
       setStatus(`⏳ Đang sửa ${i + 1}/${sorted.length}: ${sorted[i].title}`);
@@ -2677,8 +3410,8 @@
 
   // =========================================================================
   // Workflow kiểu Blender trên canvas 3D
-  //   G / R / S         : di chuyển / xoay / co giãn object đang chọn theo chuột
-  //                       (nhiều box: Shift+Click để chọn, G/R/S áp cho cả nhóm, R xoay quanh tâm nhóm)
+  //   G / W / S         : di chuyển / xoay / co giãn object đang chọn theo chuột
+  //                       (nhiều box: Shift+Click để chọn, G/W/S áp cho cả nhóm, W xoay quanh tâm nhóm)
   //   X / Y / Z         : khoá trục (bấm lần 2 = trục local của box)
   //   gõ số             : nhập giá trị chính xác (m, độ, hệ số)
   //   Ctrl (khi kéo)    : bắt bước 0.1m / 5° / 0.05
@@ -2918,7 +3651,7 @@
       it.points = applyParams(it.orig, prm);
       previewMesh(it);
     }
-    const names = { G: 'Di chuyển', R: 'Xoay', S: 'Co giãn' };
+    const names = { G: 'Di chuyển (G)', R: 'Xoay (W)', S: 'Co giãn (S)' };
     const axis = xf.axis ? ` · trục ${xf.axis}${xf.local || xf.mode === 'S' ? ' (local)' : ''}` : '';
     const typed = xf.typed ? ` · nhập: ${xf.typed}_` : '';
     hud(`${names[xf.mode]} ${targetsText()}${axis} · ${xf.info}${typed}   |   Enter/chuột trái: OK · Esc/chuột phải: huỷ · X/Y/Z: trục · Ctrl: bắt bước` +
@@ -3006,9 +3739,9 @@
       else if (xf.axis !== axis) { xf.axis = axis; xf.local = false; }
       else if (!xf.local && axis !== 'Z') xf.local = true;
       else { xf.axis = null; xf.local = false; }
-    } else if (e.code === 'KeyG' || e.code === 'KeyR' || e.code === 'KeyS') {
+    } else if (TRANSFORM_KEYS[e.code]) {
       restoreMeshes();
-      Object.assign(xf, { mode: e.code.slice(3), axis: null, local: false, typed: '', startMouse: { ...lastMouse } });
+      Object.assign(xf, { mode: TRANSFORM_KEYS[e.code], axis: null, local: false, typed: '', startMouse: { ...lastMouse } });
     } else if (/^[0-9]$/.test(k) || k === '.' || k === ',') {
       xf.typed += k === ',' ? '.' : k;
     } else if (k === '-') {
@@ -3079,6 +3812,8 @@
     return !!t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
   }
 
+  // Phím => chế độ: G di chuyển, W xoay, S co giãn
+  const TRANSFORM_KEYS = { KeyG: 'G', KeyW: 'R', KeyS: 'S' };
   const NUMPAD_VIEWS = { Numpad7: 'top', Numpad1: 'front', Numpad3: 'side', NumpadDecimal: 'focus' };
   const ALT_ACTIONS = {
     KeyQ: () => togglePanel(),
@@ -3108,9 +3843,9 @@
       cameraView(NUMPAD_VIEWS[e.code], e.ctrlKey);
       return;
     }
-    if (!e.ctrlKey && !e.shiftKey && (e.code === 'KeyG' || e.code === 'KeyR' || e.code === 'KeyS') && transformTargets().length) {
+    if (!e.ctrlKey && !e.shiftKey && TRANSFORM_KEYS[e.code] && transformTargets().length) {
       swallow(e);
-      startTransform(e.code.slice(3));
+      startTransform(TRANSFORM_KEYS[e.code]);
     }
   }
 
@@ -3296,7 +4031,7 @@
               <input type="number" step="0.1" id="cqt-multi-dz" class="cqt-input" placeholder="dZ" />
               <button id="cqt-btn-multi-shift" class="cqt-btn cqt-btn-secondary cqt-sm cqt-none" title="Dịch các box đã chọn tại frame hiện tại">↔️ Dịch</button>
             </div>
-            <div class="cqt-hint">Giữ <b>Shift + Click</b> object trên canvas hoặc danh sách để thêm/bớt. Rê chuột lên canvas bấm <b>G / R / S</b> để di chuyển / xoay (quanh tâm nhóm) / co giãn cả nhóm.</div>
+            <div class="cqt-hint">Giữ <b>Shift + Click</b> object trên canvas hoặc danh sách để thêm/bớt. Rê chuột lên canvas bấm <b>G / W / S</b> để di chuyển / xoay (quanh tâm nhóm) / co giãn cả nhóm.</div>
           </div>
 
           <div class="cqt-row">
@@ -3329,6 +4064,29 @@
             <button id="cqt-btn-apply-frame" class="cqt-btn cqt-btn-secondary" title="Chỉ frame hiện tại">✂️ Chỉ frame này</button>
           </div>
 
+          <div class="cqt-card">
+            <div class="cqt-row" style="justify-content:space-between;">
+              <span class="cqt-h">🏷️ Sub label <span id="cqt-attr-label" style="color:#38bdf8;"></span></span>
+              <button id="cqt-btn-attr-load" class="cqt-btn cqt-btn-secondary cqt-sm cqt-none" title="Hiện sub label (checkbox) của object đang chọn">Nạp</button>
+            </div>
+            <div id="cqt-attr-list" class="cqt-hint">Bấm "Nạp" (hoặc 🎯 Auto) để hiện sub label của object.</div>
+            <div class="cqt-row" style="gap:4px;">
+              <button id="cqt-btn-attr-all-on" class="cqt-btn cqt-btn-secondary cqt-sm">Tất cả ✔</button>
+              <button id="cqt-btn-attr-all-off" class="cqt-btn cqt-btn-secondary cqt-sm">Tất cả ✖</button>
+              <button id="cqt-btn-attr-all-keep" class="cqt-btn cqt-btn-secondary cqt-sm">Tất cả giữ</button>
+            </div>
+            <div class="cqt-row">
+              <select id="cqt-attr-scope" class="cqt-input">
+                <option value="track">Toàn track</option>
+                <option value="frame">Frame hiện tại</option>
+                <option value="range">Dải Start–End</option>
+              </select>
+              <button id="cqt-btn-attr-apply" class="cqt-btn cqt-btn-ground cqt-none" title="Áp cho object đang chọn hoặc cả nhóm Shift+Click">🏷️ Áp dụng</button>
+            </div>
+            <label class="cqt-check" title="Mỗi khi chọn object khác trên canvas, tự áp lựa chọn sub label của label đó"><input type="checkbox" id="cqt-attr-auto" /> Tự áp khi chọn object mới</label>
+            <div class="cqt-hint">Lựa chọn được nhớ theo từng label. "Giữ nguyên" = không đụng tới sub label đó.</div>
+          </div>
+
           <div class="cqt-divider"></div>
           <span class="cqt-h">Preset theo label</span>
           <div class="cqt-row">
@@ -3354,6 +4112,11 @@
           <div id="cqt-plane-display" class="cqt-card cqt-hint">Chưa có mặt đất — bấm "Plane từ cloud" hoặc nhập Z.</div>
           <div class="cqt-row">
             <button id="cqt-btn-calc-plane" class="cqt-btn cqt-btn-secondary" title="Fit mặt phẳng dốc Z=aX+bY+c từ point cloud quanh object">📐 Plane từ cloud</button>
+            <button id="cqt-btn-ground-prev-frame" class="cqt-btn cqt-btn-secondary" title="Kế thừa mặt phẳng đất đã lưu từ frame trước">⏮️ Ground frame trước</button>
+          </div>
+          <div class="cqt-row">
+            <input type="text" id="cqt-ground-ref-ids" class="cqt-input" placeholder="ID tham chiếu (vd: 12, 15) hoặc Shift+Click" title="Nhập danh sách ID tham chiếu cách nhau bởi dấu phẩy/khoảng trắng, hoặc Shift+Click chọn trên canvas" />
+            <button id="cqt-btn-ground-ref-boxes" class="cqt-btn cqt-btn-secondary" title="Fit mặt phẳng dốc 3D qua đáy các box tham chiếu đã chọn (≥ 2 box)">👥 Plane từ box chọn</button>
           </div>
           <div class="cqt-row">
             <button id="cqt-btn-ground-others" class="cqt-btn cqt-btn-secondary" title="Mặt phẳng ngang = trung vị đáy các box khác">📊 Z box khác</button>
@@ -3388,11 +4151,12 @@
               </select>
             </div>
           </div>
+          <label class="cqt-check" title="Khi chạy dải frame hoặc Alt+G, nếu thiếu điểm cloud sẽ tự động dùng plane của frame hợp lệ trước đó"><input type="checkbox" id="cqt-ground-auto-fallback" checked /> Tự kế thừa plane frame trước khi mất cloud</label>
           <div class="cqt-row">
             <button id="cqt-btn-check-ground" class="cqt-btn cqt-btn-secondary">📏 Kiểm tra đáy</button>
             <button id="cqt-btn-apply-ground" class="cqt-btn cqt-btn-ground">⬇️ Fit mặt đất</button>
           </div>
-          <div class="cqt-hint">Plane dốc tính từ cloud của frame hiện tại; áp cho dải dài trên đường cong có thể lệch — kiểm tra lại. <b>Alt+G</b>: tự tính mặt đất quanh từng object (đang chọn) và hạ chạm đất ở frame hiện tại.</div>
+          <div class="cqt-hint">Plane dốc tính từ cloud hoặc box tham chiếu; <b>⏮️</b> kế thừa frame trước khi mất cloud. <b>Alt+G</b>: tự tính mặt đất quanh từng object (đang chọn) và hạ chạm đất ở frame hiện tại.</div>
         </div>
 
         <!-- ================= TRACK ================= -->
@@ -3427,7 +4191,7 @@
           </div>
           <div class="cqt-row">
             <div class="cqt-col"><span class="cqt-label">Góc xoay (°)</span><input type="number" step="1" id="cqt-rotate-deg" class="cqt-input" value="180" /></div>
-            <button id="cqt-btn-rotate-angle" class="cqt-btn cqt-btn-secondary" style="margin-top:17px;">🔄 Xoay</button>
+            <button id="cqt-btn-rotate-angle" class="cqt-btn cqt-btn-secondary" style="margin-top:17px;" title="Xoay theo số độ (hoặc bấm W trên canvas 3D)">🔄 Xoay</button>
           </div>
           <div class="cqt-row" style="gap:4px;">
             <button data-rotate="180" class="cqt-btn cqt-btn-secondary">180°</button>
@@ -3444,11 +4208,16 @@
         <!-- ================= QA ================= -->
         <div class="cqt-pane" data-pane="qa">
           <div class="cqt-card">
+            <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-missing-track" /> Thiếu track_id</label>
+            <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-duplicate-track" /> Trùng track_id trong 1 frame</label>
+            <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-unknown-class" /> Nhãn không thuộc class_groups</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-scale" /> Scale không đồng bộ, lệch &gt; <input type="number" step="0.001" id="cqt-qa-scale-tol" class="cqt-input cqt-mini" /> m so với size chuẩn track</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-yaw" /> Đổi hướng đột ngột &gt; <input type="number" id="cqt-qa-yaw-threshold" class="cqt-input cqt-mini" />°</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-overlap" /> Chồng lấn (ped–ped cho IoU ≤ <input type="number" step="0.05" id="cqt-qa-pedped-iou" class="cqt-input cqt-mini" />)</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-dist" /> Quá xa &gt; <input type="number" id="cqt-qa-dist-threshold" class="cqt-input cqt-mini" /> m</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-check-limits" /> Ngoài limits LWH của class</label>
+            <label class="cqt-check" title="Tool tự chuyển qua từng frame để đọc point cloud, nên chậm hơn các mục khác"><input type="checkbox" id="cqt-qa-check-ground" /> Chưa chạm đất, đáy lệch &gt; <input type="number" step="0.01" id="cqt-qa-ground-tol" class="cqt-input cqt-mini" /> m (chậm)</label>
+            <label class="cqt-check" style="margin-left:18px"><input type="checkbox" id="cqt-qa-ground-all" /> Xét cả frame nội suy (bỏ chọn = chỉ keyframe)</label>
             <label class="cqt-check"><input type="checkbox" id="cqt-qa-whole-job" /> Quét toàn job (bỏ chọn = dải Start–End)</label>
           </div>
           <div class="cqt-row">
@@ -3477,7 +4246,7 @@
           <label class="cqt-check"><input type="checkbox" id="cqt-set-blender" /> Phím kiểu Blender trên canvas 3D</label>
           <div class="cqt-hint">
             Rê chuột trên canvas 3D, chọn 1 object rồi:<br>
-            <b>G</b> di chuyển · <b>R</b> xoay · <b>S</b> co giãn (giữ đáy) — áp cho cả nhóm nếu đã Shift+Click chọn nhiều box → <b>X/Y/Z</b> khoá trục (X/Y bấm 2 lần = trục của box) · gõ số để nhập chính xác · <b>Ctrl</b> bắt bước · <b>Enter</b>/chuột trái OK · <b>Esc</b>/chuột phải huỷ.<br>
+            <b>G</b> di chuyển · <b>W</b> xoay · <b>S</b> co giãn (giữ đáy) — áp cho cả nhóm nếu đã Shift+Click chọn nhiều box → <b>X/Y/Z</b> khoá trục (X/Y bấm 2 lần = trục của box) · gõ số để nhập chính xác · <b>Ctrl</b> bắt bước · <b>Enter</b>/chuột trái OK · <b>Esc</b>/chuột phải huỷ.<br>
             <b>Numpad 7/1/3</b> Top/Front/Side (Ctrl = phía đối diện) · <b>Numpad .</b> Focus.<br>
             <b>Alt+Q</b> panel · <b>Alt+S</b> Smart Snap · <b>Alt+G</b> chạm đất · <b>Alt+F/7/1/3</b> camera.
           </div>
@@ -3500,7 +4269,7 @@
             <button id="cqt-btn-limit-save" class="cqt-btn">💾 Lưu limits</button>
             <button id="cqt-btn-limit-reset" class="cqt-btn cqt-btn-secondary">↺ Tiêu chuẩn</button>
           </div>
-          <label class="cqt-check"><input type="checkbox" id="cqt-limit-clamp-on-apply" checked /> Tự kẹp khi Áp dụng LWH</label>
+          <label class="cqt-check"><input type="checkbox" id="cqt-limit-clamp-on-apply" /> Ép theo limits khi Áp dụng LWH / auto-fix (tắt = chỉ cảnh báo)</label>
           <div class="cqt-divider"></div>
           <span class="cqt-h">Cả class</span>
           <label class="cqt-check"><input type="checkbox" id="cqt-limit-class-all-job" checked /> Quét toàn job (bỏ chọn = dải Start–End)</label>
@@ -3543,6 +4312,7 @@
     const s = getSettings();
     $('cqt-set-blender').checked = s.blenderKeys;
     $('cqt-set-bounce').checked = s.bounceRefresh;
+    $('cqt-limit-clamp-on-apply').checked = s.enforceLimits;
 
     const job = getJob();
     const frame = getFrame();
@@ -3658,6 +4428,12 @@
     on('cqt-btn-apply-lwh', () => applyLWH('range'));
     on('cqt-btn-sync-track', () => applyLWH('track'));
     on('cqt-btn-apply-frame', () => applyLWH('frame'));
+    on('cqt-btn-attr-load', () => loadAttrPanel());
+    on('cqt-btn-attr-all-on', () => setAllAttrChoices('on'));
+    on('cqt-btn-attr-all-off', () => setAllAttrChoices('off'));
+    on('cqt-btn-attr-all-keep', () => setAllAttrChoices('keep'));
+    on('cqt-btn-attr-apply', () => applyAttrProfile());
+    on('cqt-attr-auto', () => { lastAutoAttrId = activeId(); }, 'change');
     on('cqt-btn-preset-save', savePreset);
     on('cqt-btn-preset-apply', applyPreset);
     on('cqt-btn-preset-delete', deletePreset);
@@ -3667,6 +4443,8 @@
 
     // Ground
     on('cqt-btn-calc-plane', calcGroundPlane);
+    on('cqt-btn-ground-prev-frame', inheritGroundFromPrevFrame);
+    on('cqt-btn-ground-ref-boxes', groundFromReferenceBoxes);
     on('cqt-btn-ground-others', groundFromOthers);
     on('cqt-btn-ground-from-box', groundFromThisBox);
     on('cqt-ground-z', onGroundZInput, 'change');
@@ -3701,9 +4479,11 @@
     const saveSettings = () => lsSet(LS.settings, {
       blenderKeys: isChecked('cqt-set-blender'),
       bounceRefresh: isChecked('cqt-set-bounce'),
+      enforceLimits: isChecked('cqt-limit-clamp-on-apply'),
     });
     on('cqt-set-blender', saveSettings, 'change');
     on('cqt-set-bounce', saveSettings, 'change');
+    on('cqt-limit-clamp-on-apply', saveSettings, 'change');
     on('cqt-limit-class', () => { setField('cqt-limit-class-name', ''); loadLimitForm(val('cqt-limit-class')); }, 'change');
     on('cqt-btn-limit-save', saveLimitForm);
     on('cqt-btn-limit-delete', deleteLimitClass);
@@ -3728,5 +4508,6 @@
   setInterval(() => {
     if (/\/jobs\/\d+/.test(window.location.pathname) && document.querySelector('#root')) createUI();
     syncFrameLabel();
+    autoAttrTick();
   }, 1000);
 })();
