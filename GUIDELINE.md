@@ -1,14 +1,20 @@
-# CVAT Cuboid Toolbox v3.1.0 — Hướng dẫn đầy đủ
+# CVAT Cuboid Toolbox v3.3.0 — Hướng dẫn đầy đủ
 
-Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: Smart Snap theo point cloud, sửa LWH/preset, fit mặt đất phẳng & dốc, quản lý hướng/track, chọn nhiều box, thao tác kiểu Blender, QA + auto-fix có xem trước, snapshot.
+Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: Smart Snap theo point cloud, sửa LWH/preset, fit mặt đất phẳng & dốc (point cloud & box tham chiếu), kế thừa ground frame trước, quản lý hướng/track, chọn nhiều box, thao tác kiểu Blender, QA + auto-fix có xem trước, snapshot.
 
-> File script: `cvat-cuboid-quicktool.user.js` (v3.1.0)  
-> Tài liệu cập nhật: 27/10/2026 — khớp với code v3.1.0.  
+> File script: `cvat-cuboid-quicktool.user.js` (v3.3.0)  
+> Tài liệu cập nhật: 30/10/2026 — khớp với code v3.3.0.  
 > Chỉ chạy trên trang `/jobs/<id>` của CVAT. Không cần reload sau khi cài.
 >
-> **Đang dùng bản 2.x?** Đọc mục [1.5](#15-khác-biệt-so-với-bản-2x-đọc-trước-khi-nâng-cấp) trước — bản 3.x bỏ và đổi khá nhiều thứ.
+> **Đang dùng bản cũ?** Đọc mục [1.5](#15-khác-biệt-so-với-bản-2x-đọc-trước-khi-nâng-cấp) và [14](#14-lịch-sử-phiên-bản) để xem các thay đổi mới.
 
-### Có gì mới ở 3.1.0
+### Có gì mới ở 3.3.0
+
+- **👥 Plane từ box tham chiếu**: Fit mặt phẳng dốc 3D $Z = aX + bY + c$ qua đáy các box xung quanh đã chuẩn đất (chọn qua Shift+Click hoặc gõ danh sách ID, cần $\ge 2$ box). Giải bình phương tối thiểu (LSQ), tự loại bỏ dốc ảo $>15^\circ$.
+- **⏮️ Kế thừa Ground frame trước**: Nút bấm lấy lại mặt phẳng đất của frame trước ($F-1$). Kèm tuỳ chọn **Tự kế thừa plane frame trước khi mất cloud** khi fit dải hoặc bấm Alt+G.
+- **🗃️ Ground Plane Cache**: Tự động lưu trữ và quản lý cache mặt phẳng đất theo timeline từng frame.
+
+### Tính năng cốt lõi (v3.1.0 – v3.2.0)
 
 - **🧲 Smart Snap** (Alt+S) + *Fit size*: hút box theo cụm LiDAR, tự xoay yaw, đáy chạm đất, lặp 4 lượt.
 - **🎥 Camera preset** + **thao tác Blender**: **G/R/S**, khoá trục **X/Y/Z**, nhập số, **Ctrl** bắt bước, xoay cả nhóm quanh tâm.
@@ -16,7 +22,7 @@ Userscript hỗ trợ gán nhãn **CVAT 3D Cuboid**: Smart Snap theo point cloud
 - **📐 Mặt phẳng dốc** `Z = aX + bY + c` từ point cloud, mode *Nghiêng theo dốc*; giữ cả chế độ Z phẳng.
 - **🧭 Công cụ hướng**: đo góc đầu vs hướng đi, nắn theo hướng đi/cloud, đồng bộ yaw toàn track, sửa frame lộn đầu, cắt phần track quá xa.
 - **🔎 QA thế hệ mới**: scale lệch, đổi hướng đột ngột, chồng lấn BEV, quá xa, ngoài limits; lọc kết quả; **auto-fix có xem trước**; CSV 9 cột.
-- **🙈 Outside thay xoá**, **chỉ thêm keyframe** (bỏ decimate/resample), **snapshot trong bộ nhớ** (10 bản), Limits gộp vào tab **Cài đặt**.
+- **🙈 Outside thay xoá**, **chỉ thêm keyframe**, **snapshot trong bộ nhớ** (10 bản), Limits gộp vào tab **Cài đặt**.
 
 ---
 
@@ -459,19 +465,35 @@ CVAT **không có khái niệm mặt đất**. `z = 0` chỉ là gốc toạ đ�
 
 Nếu nhập sai Z, box sẽ lún hoặc bay đúng bằng khoảng chênh đó. Vì vậy hãy lấy Z/mặt phẳng từ dữ liệu trước khi fit.
 
-### 5.2. Bốn cách xác định mặt đất
+### 5.2. Sáu cách xác định mặt đất
 
 | Nút | Cách hoạt động | Khi nào dùng |
 |---|---|---|
 | **📐 Plane từ cloud** | Fit mặt phẳng dốc `Z = aX + bY + c` từ vành khuyên quanh footprint của object đang chọn | Tốt nhất khi có PCD, đặc biệt đường dốc |
-| **📊 Z box khác** | Trung vị đáy của **≥ 2** cuboid khác ở frame hiện tại | Khi không đọc được cloud |
-| **📌 Z từ box này** | Lấy đáy của object đang chọn (mặt phẳng ngang) | Khi object này đã đúng |
+| **⏮️ Ground frame trước** | Kế thừa mặt phẳng đất đã lưu từ frame liền trước ($F-1$ hoặc frame gần nhất) | Khi xe chạy trên đường phẳng/dốc đều hoặc frame hiện tại bị thưa/mất điểm PCD |
+| **👥 Plane từ box chọn** | Fit mặt phẳng dốc 3D qua 4 góc đáy của các box tham chiếu (chọn qua Shift+Click hoặc gõ ID, $\ge 2$ box) | Khi target ở xa/khuất điểm nhưng xung quanh có các xe khác đã đặt chuẩn đất |
+| **📊 Z box khác** | Trung vị đáy của **≥ 2** cuboid khác ở frame hiện tại (mặt phẳng ngang) | Khi không đọc được cloud và mặt đường tương đối phẳng |
+| **📌 Z từ box này** | Lấy đáy của object đang chọn (mặt phẳng ngang) | Khi object này đã tiếp đất chuẩn |
 | **Nhập Z mặt đất** | Gõ tay, tạo mặt phẳng ngang khi rời ô | Khi đã biết cao độ chính xác |
 
 Thẻ hiển thị phía trên cho biết mặt phẳng hiện tại:
 
 - Mặt ngang: `Mặt phẳng ngang Z = -1.700m — nguồn`.
 - Mặt dốc: `Plane dốc 2.3°: Z = +0.0042·X -0.0011·Y -1.702 (Z tại box ≈ -1.698m, 812 điểm) — nguồn`.
+
+#### 5.2.1. Plane từ box tham chiếu (👥 Plane từ box chọn)
+- **Cách chọn box**:
+  - Dùng **Shift + Click** trên canvas 3D để chọn các box xung quanh đã nằm chuẩn trên mặt đường.
+  - Hoặc nhập danh sách ID vào ô **ID tham chiếu** (cách nhau bởi dấu phẩy hoặc khoảng trắng, ví dụ: `12, 15, 18`).
+- **Thuật toán**:
+  - Lấy 4 góc đáy của từng box tham chiếu hợp lệ (bỏ qua box outside hoặc target box đang chọn).
+  - Giải mặt phẳng bình phương tối thiểu (LSQ Plane) qua toàn bộ các điểm đáy đó.
+  - Nếu mặt phẳng dốc bất thường ($> 15^\circ$, ví dụ do chọn nhầm box lơ lửng), tool sẽ tự động fallback về mặt phẳng ngang lấy theo trung vị $Z$ để đảm bảo an toàn.
+- **Áp dụng**: Sau khi có plane, chọn target box rồi bấm **⬇️ Fit mặt đất** (chế độ *Nghiêng theo dốc* hoặc *Snap đáy*).
+
+#### 5.2.2. Kế thừa từ frame trước (⏮️ Ground frame trước & Auto Fallback)
+- **Kế thừa thủ công**: Bấm nút **⏮️ Ground frame trước** để lấy lại plane đã lưu ở frame $F-1$ (hoặc frame gần nhất trước đó trong cache) áp cho frame hiện tại.
+- **Tự động kế thừa khi mất cloud**: Tích chọn checkbox `Tự kế thừa plane frame trước khi mất cloud`. Khi chạy Fit dải frame hoặc phím tắt **Alt+G**, nếu frame hiện tại thiếu điểm LiDAR quanh object thì tool sẽ tự động kế thừa plane của frame trước để fit, không bỏ sót frame nào.
 
 **Plane từ cloud** lấy mẫu:
 
@@ -481,7 +503,7 @@ Thẻ hiển thị phía trên cho biết mặt phẳng hiện tại:
 - Fit bình phương tối thiểu, lặp 3 lần loại outlier `|dz| > 0,12 m`, cần ≥ 10 điểm còn lại.
 - Báo số điểm và độ dốc; **không** tự áp — bạn phải bấm **Fit mặt đất**.
 
-Nếu chưa có mặt phẳng mà bấm **Kiểm tra đáy** / **Fit mặt đất**, tool tự chạy Plane từ cloud cho target; nếu không được sẽ báo lỗi.
+Nếu chưa có mặt phẳng mà bấm **Kiểm tra đáy** / **Fit mặt đất**, tool tự chạy Plane từ cloud cho target (kèm tự động fallback nếu bật); nếu không được sẽ báo lỗi.
 
 ### 5.3. Cách đặt (mode)
 
@@ -1083,6 +1105,12 @@ Trong CVAT, `save()` tại frame không phải keyframe sẽ tạo keyframe tạ
 
 ## 14. Lịch sử phiên bản
 
+- **3.3.0** (30/10/2026):
+  - **👥 Plane từ box chọn**: Cho phép chọn các box xung quanh đã chuẩn đất (qua Shift+Click hoặc gõ danh sách ID, $\ge 2$ box), lấy 4 góc đáy của từng box giải LSQ plane 3D để tạo mặt phẳng dốc chuẩn, tự loại bỏ dốc $>15^\circ$.
+  - **⏮️ Ground frame trước**: Nút bấm một chạm kế thừa mặt phẳng đất đã lưu của frame liền kề trước đó ($F-1$).
+  - **Tự kế thừa khi mất cloud**: Tuỳ chọn tự động fallback dùng plane frame trước khi chạy Fit dải hoặc Alt+G mà gặp frame thiếu điểm LiDAR.
+  - **Ground plane cache**: Bộ nhớ đệm lưu plane theo từng frame trong phiên làm việc.
+- **3.2.0** — Cập nhật logic QA ground, tinh chỉnh nhận diện điểm & đồng bộ UI.
 - **3.1.0** — Bản viết lại lớn (repo không có bản script 2.5.0; script nhảy từ 2.4.0 lên 3.1.0, còn tài liệu cũ ghi 2.5):
   - Canvas kiểu Blender: **G/R/S**, khoá trục X/Y/Z, nhập số, Ctrl bắt bước, HUD, xoay nhóm quanh tâm.
   - Camera preset: Focus/Top/Front/Side, Numpad 7/1/3/., Ctrl đối diện, Alt+F/7/1/3.
@@ -1126,6 +1154,9 @@ Trong CVAT, `save()` tại frame không phải keyframe sẽ tạo keyframe tạ
 | 📋 Copy / 📥 Paste | Object | Sao chép/dán toàn bộ transform |
 | ⭐ Đặt keyframe | Object | Thêm keyframe tại frame hiện tại |
 | 📐 Plane từ cloud | Ground | Fit mặt phẳng dốc từ PCD quanh object |
+| ⏮️ Ground frame trước | Ground | Kế thừa mặt phẳng đất đã lưu từ frame trước |
+| 👥 Plane từ box chọn | Ground | Fit mặt phẳng dốc 3D qua đáy các box tham chiếu |
+| ID tham chiếu | Ground | Ô nhập danh sách ID box tham chiếu (cách nhau bởi dấu phẩy/khoảng trắng) |
 | 📊 Z box khác | Ground | Z ngang = trung vị đáy ≥ 2 box khác |
 | 📌 Z từ box này | Ground | Z ngang = đáy object hiện tại |
 | Cách đặt | Ground | Snap đáy / Đặt phẳng / Nghiêng theo dốc |

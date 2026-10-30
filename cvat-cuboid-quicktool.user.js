@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         CVAT Cuboid Toolbox (3D) v3.2.0
+// @name         CVAT Cuboid Toolbox (3D) v3.3.0
 // @namespace    https://github.com/vantixapps/cvat-tools
-// @version      3.2.0
-// @description  Toolbox 3D cuboid cho CVAT: thao tác kiểu Blender, LWH/preset, mặt đất theo point cloud, track tools, QA + auto-fix có xem trước.
+// @version      3.3.0
+// @description  Toolbox 3D cuboid cho CVAT: thao tác kiểu Blender, LWH/preset, mặt đất theo point cloud & box tham chiếu, kế thừa frame trước, track tools, QA + auto-fix có xem trước.
 // @author       Antigravity
 // @match        https://cvat-test.vantixapps.net/*
 // @match        https://app.cvat.ai/*
@@ -24,7 +24,7 @@
   // =========================================================================
   // Cấu hình + localStorage
   // =========================================================================
-  const VERSION = '3.2.0';
+  const VERSION = '3.3.0';
   const LOG = '[CVAT-Toolbox]';
 
   const LS = {
@@ -1098,10 +1098,16 @@
   // =========================================================================
   // Mặt đất: một "ground plane" duy nhất (dốc từ point cloud, hoặc phẳng theo Z)
   // =========================================================================
-  let groundPlane = null; // { a, b, c, slopeDeg, count?, source }
+  let groundPlane = null; // { a, b, c, slopeDeg, count?, source, frame? }
+  const groundPlaneCache = new Map(); // frame -> { ...plane, source, frame }
 
   function setGroundPlane(plane, source, refPoints) {
-    groundPlane = { ...plane, source };
+    const f = getFrame();
+    const planeData = { ...plane, source, frame: Number.isInteger(f) ? f : null };
+    groundPlane = planeData;
+    if (Number.isInteger(f)) {
+      groundPlaneCache.set(f, planeData);
+    }
     const el = $('cqt-plane-display');
     if (el) {
       const z0 = refPoints ? planeZ(plane, refPoints[0], refPoints[1]) : plane.c;
@@ -1111,6 +1117,16 @@
         : `Mặt phẳng ngang Z = ${plane.c.toFixed(3)}m — ${source}`;
     }
     if (!(plane.a || plane.b)) setField('cqt-ground-z', plane.c.toFixed(3));
+  }
+
+  function findPrevGroundPlane(currentFrame) {
+    if (!Number.isInteger(currentFrame)) return null;
+    for (let f = currentFrame - 1; f >= 0; f--) {
+      if (groundPlaneCache.has(f)) {
+        return { frame: f, plane: groundPlaneCache.get(f) };
+      }
+    }
+    return null;
   }
 
   function onGroundZInput() {
@@ -1129,12 +1145,127 @@
     if (id === null) return null;
     const s = await requireCuboidAtFrame(id);
     if (!s) return null;
-    if (!getPointCloudPositions()) return fail('Không đọc được point cloud.');
-    const plane = planeFromCloud(s.points);
-    if (!plane) return fail('Không đủ điểm quanh object để fit mặt đất.');
-    setGroundPlane(plane, `cloud quanh #${id} @f${getFrame()}`, s.points);
-    setStatus(`📐 Đã tính plane dốc ${plane.slopeDeg.toFixed(1)}° từ ${plane.count} điểm. Bấm "Fit mặt đất".`, 'success');
-    return plane;
+    const frame = getFrame();
+    let plane = null;
+    if (getPointCloudPositions()) {
+      plane = planeFromCloud(s.points);
+    }
+    if (plane) {
+      setGroundPlane(plane, `cloud quanh #${id} @f${frame}`, s.points);
+      setStatus(`📐 Đã tính plane dốc ${plane.slopeDeg.toFixed(1)}° từ ${plane.count} điểm. Bấm "Fit mặt đất".`, 'success');
+      return plane;
+    }
+    if (isChecked('cqt-ground-auto-fallback')) {
+      const prev = findPrevGroundPlane(frame);
+      if (prev) {
+        setGroundPlane(prev.plane, `kế thừa từ @f${prev.frame} (f${frame} thiếu cloud)`, s.points);
+        setStatus(`⏮️ Frame ${frame} thiếu điểm cloud: Đã tự động kế thừa plane từ frame ${prev.frame}.`, 'warn');
+        return prev.plane;
+      }
+    }
+    return fail('Không đủ điểm quanh object để fit mặt đất.');
+  }
+
+  async function inheritGroundFromPrevFrame() {
+    const frame = getFrame();
+    if (!Number.isInteger(frame)) return fail('Không đọc được frame hiện tại.');
+    if (frame <= 0) return fail('Đang ở frame đầu tiên (f=0), không có frame trước.');
+
+    let prev = findPrevGroundPlane(frame);
+    if (!prev) {
+      const targetId = resolveTargetId();
+      if (Number.isInteger(targetId)) {
+        const prevS = await getState(targetId, frame - 1);
+        if (isCuboid(prevS) && !prevS.outside) {
+          prev = { frame: frame - 1, plane: flatPlane(bottomZ(prevS.points)) };
+        }
+      }
+    }
+
+    if (!prev) {
+      return fail(`Chưa có plane ở các frame trước frame ${frame}. Hãy bấm "Plane từ cloud" hoặc chọn box ở frame trước.`);
+    }
+
+    const targetId = resolveTargetId();
+    const curS = Number.isInteger(targetId) ? await getState(targetId, frame) : null;
+    const refPts = curS && isCuboid(curS) ? curS.points : null;
+
+    setGroundPlane(prev.plane, `kế thừa từ @f${prev.frame}`, refPts);
+    setStatus(
+      `⏮️ Đã kế thừa ground từ frame ${prev.frame} (${prev.plane.slopeDeg ? `dốc ${prev.plane.slopeDeg.toFixed(1)}°` : `Z = ${prev.plane.c.toFixed(3)}m`}).`,
+      'success'
+    );
+    return prev.plane;
+  }
+
+  function getReferenceBoxIds() {
+    const raw = (val('cqt-ground-ref-ids') || '').trim();
+    const ids = new Set();
+    if (raw) {
+      for (const tok of raw.split(/[\s,]+/)) {
+        const id = parseInt(tok.replace(/^#/, ''), 10);
+        if (Number.isInteger(id)) ids.add(id);
+      }
+    }
+    if (selection.size) {
+      for (const id of selection) ids.add(id);
+    }
+    const targetId = resolveTargetId();
+    if (Number.isInteger(targetId)) ids.delete(targetId);
+    return [...ids];
+  }
+
+  async function groundFromReferenceBoxes() {
+    const frame = getFrame();
+    if (!Number.isInteger(frame)) return fail('Không đọc được frame hiện tại.');
+    const refIds = getReferenceBoxIds();
+    if (refIds.length < 2) {
+      return fail('Cần ít nhất 2 box tham chiếu. Hãy Shift+Click chọn các box trên canvas hoặc nhập ID vào ô tham chiếu.');
+    }
+
+    const validBoxes = [];
+    const pts = [];
+    for (const id of refIds) {
+      const s = await getState(id, frame);
+      if (!isCuboid(s) || s.outside) continue;
+      validBoxes.push(s);
+      const corners = boxCorners(s.points);
+      corners.sort((a, b) => a[2] - b[2]);
+      for (let i = 0; i < 4; i++) pts.push(corners[i]);
+    }
+
+    if (validBoxes.length < 2) {
+      return fail(`Chỉ có ${validBoxes.length} box hợp lệ tại frame ${frame}. Cần ít nhất 2 box.`);
+    }
+
+    let plane = fitPlaneLSQ(pts);
+    let slope = plane ? Math.atan(Math.hypot(plane.a, plane.b)) * DEG : 0;
+
+    // Dốc > 15° thường do chọn nhầm box không cùng mặt đường hoặc ngoại lai -> fallback về phẳng
+    if (!plane || slope > 15) {
+      const zs = pts.map((p) => p[2]);
+      const z = median(zs);
+      plane = flatPlane(z);
+      slope = 0;
+    }
+
+    const planeObj = {
+      ...plane,
+      slopeDeg: slope,
+      count: pts.length,
+    };
+
+    const targetId = resolveTargetId();
+    const curS = Number.isInteger(targetId) ? await getState(targetId, frame) : null;
+    const refPts = curS && isCuboid(curS) ? curS.points : null;
+
+    const boxLabels = validBoxes.map((b) => '#' + b.clientID).join(', ');
+    setGroundPlane(planeObj, `từ ${validBoxes.length} box tham chiếu (${boxLabels}) @f${frame}`, refPts);
+    setStatus(
+      `📐 Đã tính plane ${slope > 0 ? `dốc ${slope.toFixed(1)}°` : 'ngang'} từ đáy ${validBoxes.length} box tham chiếu (${boxLabels}). Bấm "Fit mặt đất".`,
+      'success'
+    );
+    return planeObj;
   }
 
   async function groundFromOthers() {
@@ -1257,7 +1388,11 @@
     for (const id of list) {
       const s = await getState(id, frame);
       if (!isCuboid(s) || s.outside) continue;
-      const plane = planeFromCloud(s.points) || groundPlane;
+      let plane = planeFromCloud(s.points) || groundPlane;
+      if (!plane && isChecked('cqt-ground-auto-fallback')) {
+        const prev = findPrevGroundPlane(frame);
+        if (prev) plane = prev.plane;
+      }
       if (!plane) { noCloud++; continue; }
       await batch.edit(s, frame, (st) => {
         const after = fitToGround(st.points, plane, mode);
@@ -1268,7 +1403,7 @@
     }
     const res = await batch.finish();
     if (!res.changed) {
-      return setStatus(noCloud ? '⚠️ Không đủ điểm cloud để tìm mặt đất.' : 'ℹ️ Đã nằm sát mặt đất.', noCloud ? 'error' : 'success');
+      return setStatus(noCloud ? '⚠️ Không đủ điểm cloud để tìm mặt đất (và không có plane frame trước).' : 'ℹ️ Đã nằm sát mặt đất.', noCloud ? 'error' : 'success');
     }
     setStatus(`⬇️ Đã hạ chạm đất ${res.changed} object tại frame ${frame}.` + editSuffix(res), 'success');
   }
@@ -3977,6 +4112,11 @@
           <div id="cqt-plane-display" class="cqt-card cqt-hint">Chưa có mặt đất — bấm "Plane từ cloud" hoặc nhập Z.</div>
           <div class="cqt-row">
             <button id="cqt-btn-calc-plane" class="cqt-btn cqt-btn-secondary" title="Fit mặt phẳng dốc Z=aX+bY+c từ point cloud quanh object">📐 Plane từ cloud</button>
+            <button id="cqt-btn-ground-prev-frame" class="cqt-btn cqt-btn-secondary" title="Kế thừa mặt phẳng đất đã lưu từ frame trước">⏮️ Ground frame trước</button>
+          </div>
+          <div class="cqt-row">
+            <input type="text" id="cqt-ground-ref-ids" class="cqt-input" placeholder="ID tham chiếu (vd: 12, 15) hoặc Shift+Click" title="Nhập danh sách ID tham chiếu cách nhau bởi dấu phẩy/khoảng trắng, hoặc Shift+Click chọn trên canvas" />
+            <button id="cqt-btn-ground-ref-boxes" class="cqt-btn cqt-btn-secondary" title="Fit mặt phẳng dốc 3D qua đáy các box tham chiếu đã chọn (≥ 2 box)">👥 Plane từ box chọn</button>
           </div>
           <div class="cqt-row">
             <button id="cqt-btn-ground-others" class="cqt-btn cqt-btn-secondary" title="Mặt phẳng ngang = trung vị đáy các box khác">📊 Z box khác</button>
@@ -4011,11 +4151,12 @@
               </select>
             </div>
           </div>
+          <label class="cqt-check" title="Khi chạy dải frame hoặc Alt+G, nếu thiếu điểm cloud sẽ tự động dùng plane của frame hợp lệ trước đó"><input type="checkbox" id="cqt-ground-auto-fallback" checked /> Tự kế thừa plane frame trước khi mất cloud</label>
           <div class="cqt-row">
             <button id="cqt-btn-check-ground" class="cqt-btn cqt-btn-secondary">📏 Kiểm tra đáy</button>
             <button id="cqt-btn-apply-ground" class="cqt-btn cqt-btn-ground">⬇️ Fit mặt đất</button>
           </div>
-          <div class="cqt-hint">Plane dốc tính từ cloud của frame hiện tại; áp cho dải dài trên đường cong có thể lệch — kiểm tra lại. <b>Alt+G</b>: tự tính mặt đất quanh từng object (đang chọn) và hạ chạm đất ở frame hiện tại.</div>
+          <div class="cqt-hint">Plane dốc tính từ cloud hoặc box tham chiếu; <b>⏮️</b> kế thừa frame trước khi mất cloud. <b>Alt+G</b>: tự tính mặt đất quanh từng object (đang chọn) và hạ chạm đất ở frame hiện tại.</div>
         </div>
 
         <!-- ================= TRACK ================= -->
@@ -4302,6 +4443,8 @@
 
     // Ground
     on('cqt-btn-calc-plane', calcGroundPlane);
+    on('cqt-btn-ground-prev-frame', inheritGroundFromPrevFrame);
+    on('cqt-btn-ground-ref-boxes', groundFromReferenceBoxes);
     on('cqt-btn-ground-others', groundFromOthers);
     on('cqt-btn-ground-from-box', groundFromThisBox);
     on('cqt-ground-z', onGroundZInput, 'change');
